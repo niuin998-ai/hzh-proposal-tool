@@ -1,6 +1,8 @@
 from io import BytesIO
 import html
 import json
+import os
+import shutil
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -16,6 +18,8 @@ from pptx.enum.text import MSO_ANCHOR
 from pptx.enum.text import MSO_AUTO_SIZE
 from pptx.enum.text import PP_ALIGN
 from pptx.util import Inches, Pt
+
+from customer_pdf_generator import build_pdf_draft_from_proposal, customer_pdf_filename, generate_customer_pdf
 
 from poi_importer import (
     FIELD_LABELS as IMPORT_FIELD_LABELS,
@@ -40,11 +44,12 @@ SLIDE_W = Inches(13.333)
 SLIDE_H = Inches(7.5)
 
 BASE_DIR = Path(__file__).parent
-DATA_DIR = BASE_DIR / "data"
-OUTPUTS_DIR = BASE_DIR / "outputs"
+STORAGE_DIR = Path(os.getenv("HZH_STORAGE_DIR", str(BASE_DIR))).expanduser()
+DATA_DIR = Path(os.getenv("HZH_DATA_DIR", str(STORAGE_DIR / "data"))).expanduser()
+OUTPUTS_DIR = Path(os.getenv("HZH_OUTPUTS_DIR", str(STORAGE_DIR / "outputs"))).expanduser()
 ASSETS_DIR = BASE_DIR / "assets"
 LOGO_DIR = ASSETS_DIR / "logo"
-POI_IMAGE_DIR = ASSETS_DIR / "poi_images"
+POI_IMAGE_DIR = Path(os.getenv("HZH_POI_IMAGE_DIR", str(STORAGE_DIR / "assets" / "poi_images"))).expanduser()
 LOGO_MARK_PATH = LOGO_DIR / "hzh-logo-mark.png"
 LOGO_FULL_PATH = LOGO_DIR / "hzh-logo-full.png"
 POI_DB_PATH = DATA_DIR / "poi_database.csv"
@@ -635,7 +640,10 @@ def save_uploaded_poi_image(uploaded_file, poi_id, name_hint=""):
     filename = f"{safe_id}_{safe_name}_{int(time.time())}{suffix}"
     output_path = POI_IMAGE_DIR / filename
     output_path.write_bytes(uploaded_file.getvalue())
-    return str(output_path.relative_to(BASE_DIR))
+    try:
+        return str(output_path.relative_to(BASE_DIR))
+    except ValueError:
+        return str(output_path)
 
 
 def resolve_local_image_path(path_value):
@@ -746,13 +754,17 @@ def normalize_poi_df(df):
 
 def ensure_poi_files():
     """Create the local POI database and import template if they do not exist."""
-    DATA_DIR.mkdir(exist_ok=True)
-    OUTPUTS_DIR.mkdir(exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
     LOGO_DIR.mkdir(parents=True, exist_ok=True)
     POI_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
 
     if not POI_DB_PATH.exists():
-        normalize_poi_df(pd.DataFrame(DEFAULT_POIS)).to_csv(POI_DB_PATH, index=False)
+        seed_path = BASE_DIR / "data" / "poi_database.csv"
+        if seed_path.exists() and seed_path.resolve() != POI_DB_PATH.resolve():
+            shutil.copyfile(seed_path, POI_DB_PATH)
+        else:
+            normalize_poi_df(pd.DataFrame(DEFAULT_POIS)).to_csv(POI_DB_PATH, index=False)
 
     if not POI_TEMPLATE_PATH.exists():
         template = pd.DataFrame([{column: "" for column in POI_COLUMNS}])
@@ -2633,6 +2645,16 @@ if main_nav == "方案生成":
         st.session_state.day_poi_ids = []
     if "route_pricing_preview" not in st.session_state:
         st.session_state.route_pricing_preview = {}
+    if "pdf_draft" not in st.session_state:
+        st.session_state.pdf_draft = None
+    if "pdf_draft_ready" not in st.session_state:
+        st.session_state.pdf_draft_ready = False
+    if "pdf_overwrite_confirm" not in st.session_state:
+        st.session_state.pdf_overwrite_confirm = False
+    if "customer_pdf_bytes" not in st.session_state:
+        st.session_state.customer_pdf_bytes = None
+    if "pdf_draft_version" not in st.session_state:
+        st.session_state.pdf_draft_version = 0
 
     with st.sidebar:
         st.header("方案基础信息")
@@ -2977,6 +2999,178 @@ if main_nav == "方案生成":
     else:
         pricing_result = calculate_pricing_preview([], None, None, None, None, None, "")
         st.write("方案初稿生成后，可在这里进行价格核算和报价预览。")
+
+
+    st.subheader("客户宣传页 PDF")
+    st.caption("PDF 使用两阶段流程：先生成可编辑内容草稿，确认修改后再生成最终客户宣传页 PDF。")
+    pdf_ready = st.session_state.generationStatus == "completed" and bool(itinerary_records(itinerary))
+    pdf_cols = st.columns([1, 1, 2])
+    with pdf_cols[0]:
+        create_pdf_draft_clicked = st.button("生成 PDF 内容草稿", type="secondary", disabled=not pdf_ready)
+    with pdf_cols[1]:
+        regenerate_pdf_draft_clicked = False
+        if st.session_state.get("pdf_draft_ready"):
+            regenerate_pdf_draft_clicked = st.button("重新生成草稿", type="secondary")
+    if not pdf_ready:
+        st.info("请先生成方案后再生成 PDF 内容草稿。")
+
+    def create_customer_pdf_draft(keep_client_name=False):
+        existing_client_name = ""
+        if keep_client_name and st.session_state.get("pdf_draft"):
+            existing_client_name = st.session_state.pdf_draft.get("cover", {}).get("clientName", "")
+        return build_pdf_draft_from_proposal(
+            title=title,
+            client_name=existing_client_name,
+            group_size=group_size,
+            days=days,
+            nights=nights,
+            route_cities=route_cities,
+            intro=generated_intro,
+            itinerary=itinerary_records(itinerary),
+            day_pois=day_pois,
+            includes=includes,
+            excludes=excludes,
+            pricing_result=pricing_result,
+            customer_type=customer_type,
+        )
+
+    if create_pdf_draft_clicked:
+        if st.session_state.get("pdf_draft_ready") and st.session_state.get("pdf_draft"):
+            st.session_state.pdf_overwrite_confirm = True
+        else:
+            st.session_state.pdf_draft = create_customer_pdf_draft()
+            st.session_state.pdf_draft_ready = True
+            st.session_state.customer_pdf_bytes = None
+            st.session_state.pdf_draft_version += 1
+            st.success("PDF 内容草稿已生成，可在下方编辑后再生成最终 PDF。")
+
+    if regenerate_pdf_draft_clicked:
+        st.session_state.pdf_overwrite_confirm = True
+
+    if st.session_state.get("pdf_overwrite_confirm"):
+        st.warning("当前已有 PDF 草稿内容，重新生成会覆盖已编辑内容，是否继续？")
+        confirm_cols = st.columns([1, 1, 3])
+        with confirm_cols[0]:
+            if st.button("确认覆盖草稿", type="primary"):
+                st.session_state.pdf_draft = create_customer_pdf_draft(keep_client_name=True)
+                st.session_state.pdf_draft_ready = True
+                st.session_state.pdf_overwrite_confirm = False
+                st.session_state.customer_pdf_bytes = None
+                st.session_state.pdf_draft_version += 1
+                st.success("PDF 内容草稿已重新生成。")
+                st.rerun()
+        with confirm_cols[1]:
+            if st.button("保留当前草稿"):
+                st.session_state.pdf_overwrite_confirm = False
+                st.rerun()
+
+    if st.session_state.get("pdf_draft_ready") and st.session_state.get("pdf_draft"):
+        draft = st.session_state.pdf_draft
+        draft_version = st.session_state.pdf_draft_version
+        st.markdown("### 客户宣传页内容编辑区")
+        edit_tabs = st.tabs([
+            "封面信息",
+            "方案概览",
+            "顾问推荐意见",
+            "每日行程内容",
+            "Included / Not Included",
+            "Pricing Summary",
+            "Next Steps",
+        ])
+
+        with edit_tabs[0]:
+            cover = draft.setdefault("cover", {})
+            cover["title"] = st.text_input("PDF 标题", cover.get("title", ""), key=f"pdf_cover_title_{draft_version}")
+            cover["clientName"] = st.text_input("客户姓名", cover.get("clientName", "Valued Client"), key=f"pdf_cover_client_{draft_version}")
+            cover["publishedDate"] = st.text_input("生成日期", cover.get("publishedDate", ""), key=f"pdf_cover_date_{draft_version}")
+            cover["validity"] = st.text_input("有效期", cover.get("validity", "30 days"), key=f"pdf_cover_validity_{draft_version}")
+            cover["heroTitle"] = st.text_input("主标题", cover.get("heroTitle", ""), key=f"pdf_cover_hero_{draft_version}")
+            cover["subtitle"] = st.text_area("副标题 / 宣传页说明", cover.get("subtitle", cover.get("introText", "")), height=90, key=f"pdf_cover_subtitle_{draft_version}")
+            cover["introText"] = st.text_area("简短介绍文案", cover.get("introText", ""), height=130, key=f"pdf_cover_intro_{draft_version}")
+            cover["quotedPrice"] = st.text_input("客户展示报价", cover.get("quotedPrice", "To be confirmed"), key=f"pdf_cover_quote_{draft_version}")
+            cover["heroImagePath"] = st.text_input("首页主视觉图片路径 / 自动选图", cover.get("heroImagePath", ""), key=f"pdf_cover_image_{draft_version}")
+
+        with edit_tabs[1]:
+            overview = draft.setdefault("overview", {})
+            overview["tripType"] = st.text_input("Trip Type", overview.get("tripType", ""), key=f"pdf_overview_trip_{draft_version}")
+            overview["duration"] = st.text_input("Duration", overview.get("duration", ""), key=f"pdf_overview_duration_{draft_version}")
+            overview["medicalCore"] = st.text_input("Medical Core", overview.get("medicalCore", ""), key=f"pdf_overview_medical_{draft_version}")
+            overview["service"] = st.text_input("Service", overview.get("service", ""), key=f"pdf_overview_service_{draft_version}")
+            overview["summary"] = st.text_area("方案摘要", overview.get("summary", ""), height=140, key=f"pdf_overview_summary_{draft_version}")
+
+        with edit_tabs[2]:
+            recommendation = draft.setdefault("recommendation", {})
+            recommendation["title"] = st.text_input("Consultant Recommendation 标题", recommendation.get("title", ""), key=f"pdf_rec_title_{draft_version}")
+            recommendation["body"] = st.text_area("推荐说明正文", recommendation.get("body", ""), height=140, key=f"pdf_rec_body_{draft_version}")
+            recommendation["medicalCore"] = st.text_input("医疗核心说明", recommendation.get("medicalCore", ""), key=f"pdf_rec_medical_{draft_version}")
+            recommendation["highlights"] = st.text_area("体检套餐亮点", recommendation.get("highlights", ""), height=110, key=f"pdf_rec_highlights_{draft_version}")
+            recommendation["targetUsers"] = st.text_area("适合人群", recommendation.get("targetUsers", ""), height=90, key=f"pdf_rec_target_{draft_version}")
+            recommendation["serviceNote"] = st.text_area("服务说明", recommendation.get("serviceNote", ""), height=110, key=f"pdf_rec_service_{draft_version}")
+            recommendation["imagePath"] = st.text_input("医疗/顾问推荐图片路径 / 自动选图", recommendation.get("imagePath", ""), key=f"pdf_rec_image_{draft_version}")
+
+        with edit_tabs[3]:
+            itinerary_draft = draft.setdefault("itinerary", [])
+            if not itinerary_draft:
+                st.info("当前没有可编辑的每日行程。")
+            for day_index, day in enumerate(itinerary_draft):
+                with st.expander(f"第 {day.get('day', day_index + 1)} 天 - {day.get('title', '')}", expanded=day_index == 0):
+                    day["dayTitle"] = st.text_input("Day 标题", day.get("dayTitle", f"Day {day_index + 1}"), key=f"pdf_day_title_{draft_version}_{day_index}")
+                    day["title"] = st.text_input("当日英文标题", day.get("title", ""), key=f"pdf_day_headline_{draft_version}_{day_index}")
+                    day["description"] = st.text_area("当日行程描述", day.get("description", ""), height=120, key=f"pdf_day_desc_{draft_version}_{day_index}")
+                    day["pois"] = st.text_area("当日包含的 POI（每行一条）", day.get("pois", ""), height=90, key=f"pdf_day_pois_{draft_version}_{day_index}")
+                    day["tags"] = st.text_input("当日标签", day.get("tags", ""), key=f"pdf_day_tags_{draft_version}_{day_index}")
+                    day["imagePath"] = st.text_input("当日图片路径 / 自动选图", day.get("imagePath", ""), key=f"pdf_day_image_{draft_version}_{day_index}")
+                    uploaded_pdf_day_image = st.file_uploader(
+                        "上传当天图片（可选）",
+                        type=["png", "jpg", "jpeg", "webp"],
+                        key=f"pdf_day_upload_{draft_version}_{day_index}",
+                    )
+                    if uploaded_pdf_day_image:
+                        POI_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+                        suffix = Path(uploaded_pdf_day_image.name).suffix.lower() or ".png"
+                        image_target = POI_IMAGE_DIR / f"pdf_day_{draft_version}_{day_index}_{uuid4().hex[:8]}{suffix}"
+                        image_target.write_bytes(uploaded_pdf_day_image.getbuffer())
+                        day["imagePath"] = str(image_target)
+                    if day.get("imagePath"):
+                        st.caption(f"当前图片：{day.get('imagePath')}")
+
+        with edit_tabs[4]:
+            draft["included"] = st.text_area("Included 内容（每行一条）", draft.get("included", ""), height=180, key=f"pdf_included_{draft_version}")
+            draft["notIncluded"] = st.text_area("Not Included / To Confirm 内容（每行一条）", draft.get("notIncluded", ""), height=180, key=f"pdf_not_included_{draft_version}")
+
+        with edit_tabs[5]:
+            pricing_draft = draft.setdefault("pricing", {})
+            pricing_draft["clientFacingPrice"] = st.text_input("Client-facing Price", pricing_draft.get("clientFacingPrice", "To be confirmed"), key=f"pdf_price_quote_{draft_version}")
+            pricing_draft["pricingNote"] = st.text_area("价格说明", pricing_draft.get("pricingNote", ""), height=120, key=f"pdf_price_note_{draft_version}")
+            pricing_draft["finalNote"] = st.text_area("最终价格确认说明", pricing_draft.get("finalNote", ""), height=100, key=f"pdf_price_final_{draft_version}")
+
+        with edit_tabs[6]:
+            next_steps = draft.setdefault("nextSteps", {})
+            next_steps["items"] = st.text_area("客户需要确认的信息（每行一条）", next_steps.get("items", ""), height=170, key=f"pdf_next_items_{draft_version}")
+            next_steps["cta"] = st.text_input("下一步说明", next_steps.get("cta", "Contact HZH consultant to confirm availability"), key=f"pdf_next_cta_{draft_version}")
+            next_steps["note"] = st.text_area("联系或确认说明", next_steps.get("note", ""), height=110, key=f"pdf_next_note_{draft_version}")
+
+        st.session_state.pdf_draft = draft
+        pdf_action_cols = st.columns([1, 1, 2])
+        with pdf_action_cols[0]:
+            if st.button("生成最终客户宣传页 PDF", type="primary"):
+                try:
+                    st.session_state.customer_pdf_bytes = generate_customer_pdf(
+                        st.session_state.pdf_draft,
+                        logo_path=str(LOGO_FULL_PATH) if LOGO_FULL_PATH.exists() else None,
+                    )
+                    st.success("最终客户宣传页 PDF 已生成。")
+                except ImportError:
+                    st.error("当前环境缺少 PDF 依赖 ReportLab。请先运行 pip install -r requirements.txt 后再生成 PDF。")
+                except Exception as exc:
+                    st.error(f"生成客户宣传页 PDF 失败：{exc}")
+        if st.session_state.get("customer_pdf_bytes"):
+            st.download_button(
+                "下载客户宣传页 PDF",
+                data=st.session_state.customer_pdf_bytes,
+                file_name=customer_pdf_filename(st.session_state.pdf_draft),
+                mime="application/pdf",
+            )
 
     export_ready = st.session_state.generationStatus == "completed" and bool(itinerary_records(itinerary))
     if not export_ready:

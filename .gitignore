@@ -6,5 +6,10 @@ __pycache__/
 
 outputs/
 work/
-__pycache__/
-.DS_Store
+.env
+.env.*
+!.env.example
+.streamlit_home/
+*.log
+.pytest_cache/
+.mypy_cache/

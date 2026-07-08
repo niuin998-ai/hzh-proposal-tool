@@ -2,8 +2,11 @@ from io import BytesIO
 import html
 import json
 import os
+import re
 import shutil
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from uuid import uuid4
 from urllib.parse import quote
@@ -231,6 +234,7 @@ CITY_ALIASES = {
     "hangzhou": ["hangzhou", "杭州", "杭州径山"],
     "yiwu": ["yiwu", "义乌"],
     "shanghai": ["shanghai", "上海"],
+    "guangzhou": ["guangzhou", "广州", "廣州"],
     "general": ["general", "通用"],
 }
 
@@ -245,6 +249,94 @@ def city_matches(poi_city, itinerary_city):
         return True
     aliases = CITY_ALIASES.get(city_text, [city_text])
     return any(alias.lower() == poi_text or alias.lower() in poi_text for alias in aliases)
+
+
+def city_key(value):
+    """Return the canonical city key used for hard POI matching."""
+    text = clean_text(value).lower()
+    if not text:
+        return ""
+    for key, aliases in CITY_ALIASES.items():
+        if key == "general":
+            continue
+        if text == key or any(alias.lower() == text or alias.lower() in text for alias in aliases):
+            return key
+    return text
+
+
+def poi_allowed_for_city(poi, itinerary_city):
+    """Hard city constraint for route generation and default manual choices."""
+    return bool(clean_text(itinerary_city)) and city_matches(poi.get("city"), itinerary_city)
+
+
+def normalize_itinerary_and_pois(itinerary_rows, day_poi_ids=None, poi_df=None):
+    """Keep Day numbers continuous and remove POIs that do not match the day's city."""
+    rows = []
+    normalized_ids = []
+    source_ids = day_poi_ids or []
+    poi_lookup = {}
+    if poi_df is not None and hasattr(poi_df, "iterrows"):
+        poi_lookup = {str(row.get("poi_id")): row.to_dict() for _, row in poi_df.iterrows()}
+
+    for index, row in enumerate(itinerary_records(itinerary_rows), start=1):
+        updated = dict(row)
+        updated["Day"] = index
+        rows.append(updated)
+        saved_ids = source_ids[index - 1] if index - 1 < len(source_ids) else []
+        city = clean_text(updated.get("City"))
+        kept = []
+        for poi_id in saved_ids:
+            poi = poi_lookup.get(str(poi_id))
+            if poi is None or poi_allowed_for_city(poi, city):
+                kept.append(poi_id)
+            else:
+                print(f"POI city mismatch: itinerary city {city} but POI city {poi.get('city')} ({poi_id})")
+        normalized_ids.append(kept)
+    return rows, normalized_ids
+
+
+def is_medical_theme(theme):
+    text = clean_text(theme).lower()
+    return any(word in text for word in ["medical", "health check", "consultation", "screening", "体检", "医疗"])
+
+
+def validate_generated_route(itinerary_rows, day_poi_ids, poi_df, requirements=None):
+    """Post-generation guardrails for day numbering, city matching, and duplicate medical days."""
+    rows, normalized_ids = normalize_itinerary_and_pois(itinerary_rows, day_poi_ids, poi_df)
+    medical_indices = [index for index, row in enumerate(rows) if is_medical_theme(row.get("Theme"))]
+    if len(medical_indices) > 1:
+        primary = medical_indices[0]
+        for duplicate in medical_indices[1:]:
+            city = clean_text(rows[duplicate].get("City"))
+            rows[duplicate]["Theme"] = generated_theme(rows[duplicate]["Day"], len(rows), city)
+            if is_medical_theme(rows[duplicate]["Theme"]):
+                rows[duplicate]["Theme"] = "Wellness & Local Experience"
+            rows[duplicate]["Arrangement"] = generic_client_arrangement(rows[duplicate]["Day"], len(rows), city, rows[duplicate]["Theme"])
+            print(f"Duplicate medical day adjusted: Day {duplicate + 1} merged into Day {primary + 1}")
+        city = clean_text(rows[primary].get("City"))
+        rows[primary]["Theme"] = "Group Health Checkup & Recovery"
+        rows[primary]["Arrangement"] = f"Coordinated health checkups for all travelers in {city}, with bilingual support, private transfers, and recovery-friendly arrangements."
+    return rows, normalized_ids
+
+
+def reorder_itinerary_by_labels(itinerary_rows, day_poi_ids, sorted_labels):
+    """Apply drag-sort labels back to itinerary rows and selected POIs."""
+    rows = itinerary_records(itinerary_rows)
+    if not rows or not sorted_labels:
+        return rows, day_poi_ids
+    label_to_index = {itinerary_sort_label(row, index): index for index, row in enumerate(rows)}
+    ordered_indices = [label_to_index[label] for label in sorted_labels if label in label_to_index]
+    if len(ordered_indices) != len(rows):
+        return rows, day_poi_ids
+    reordered_rows = [dict(rows[index]) for index in ordered_indices]
+    reordered_pois = [day_poi_ids[index] if index < len(day_poi_ids) else [] for index in ordered_indices]
+    return normalize_itinerary_and_pois(reordered_rows, reordered_pois, active_poi_df if "active_poi_df" in globals() else None)
+
+
+def itinerary_sort_label(row, index):
+    city = clean_text(row.get("City")) or "City TBD"
+    theme = clean_text(row.get("Theme")) or "Untitled"
+    return f"Day {index + 1} | {city} | {theme}"
 
 
 
@@ -354,6 +446,37 @@ def inject_app_theme():
         [data-baseweb="radio"] [aria-checked="true"] {
           border-color: var(--color-primary) !important;
           background-color: var(--color-primary) !important;
+        }
+        .poi-source-badges {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+          margin: 6px 0 16px 0;
+        }
+        .poi-source-badge {
+          display: inline-flex;
+          align-items: center;
+          border-radius: 999px;
+          padding: 5px 10px;
+          font-size: 13px;
+          line-height: 1.2;
+          border: 1px solid transparent;
+          white-space: nowrap;
+        }
+        .poi-source-badge.db {
+          background: #EAF2FF;
+          color: #1E40AF;
+          border-color: #BFDBFE;
+        }
+        .poi-source-badge.ai {
+          background: #FFF7ED;
+          color: #C2410C;
+          border-color: #FDBA74;
+        }
+        .poi-source-legend {
+          color: #64748B;
+          font-size: 13px;
+          margin: -2px 0 8px 0;
         }
         [data-testid="stSidebar"] {
           border-right: 1px solid var(--color-border);
@@ -956,6 +1079,76 @@ def selected_poi_records(poi_df, poi_ids):
     return records
 
 
+def suggested_pois_for_day(city, theme, requirements=None, count=2):
+    """Create clearly marked AI suggestions when the local POI database has no match."""
+    city = clean_text(city) or "Selected City"
+    theme_text = clean_text(theme)
+    candidates = []
+    if is_medical_theme(theme_text):
+        candidates = [
+            f"{city} International Health Checkup Center",
+            f"{city} Recovery-friendly Wellness Lounge",
+        ]
+    elif keyword_hit(theme_text, ["Technology", "Business", "Innovation", "科技", "商务"]):
+        candidates = [
+            f"{city} Technology Enterprise Visit",
+            f"{city} Innovation District Experience",
+        ]
+    elif keyword_hit(theme_text, ["Culture", "Cultural", "Heritage", "文化"]):
+        candidates = [
+            f"{city} Cultural Landmark Experience",
+            f"{city} Local Lifestyle Visit",
+        ]
+    elif keyword_hit(theme_text, ["Wellness", "Recovery", "康养"]):
+        candidates = [
+            f"{city} Wellness Experience",
+            f"{city} Healthy Dining Arrangement",
+        ]
+    elif keyword_hit(theme_text, ["Arrival", "Departure"]):
+        candidates = [
+            f"{city} Private Transfer Service",
+            f"{city} Hotel Check-in Support",
+        ]
+    else:
+        candidates = [
+            f"{city} Curated Local Experience",
+            f"{city} Concierge Dining Arrangement",
+        ]
+    return [
+        {"name": name, "source": "ai_suggestion", "status": "未入库", "city": city}
+        for name in candidates[:count]
+    ]
+
+
+def ensure_proposal_suggested_pois(proposal):
+    """Attach non-database AI suggestion labels for days without selected database POIs."""
+    for day in proposal.get("itinerary") or []:
+        if day.get("poi_ids"):
+            day.setdefault("suggested_pois", [])
+        elif not day.get("suggested_pois"):
+            day["suggested_pois"] = suggested_pois_for_day(day.get("city"), day.get("theme"))
+    return proposal
+
+
+def poi_source_badges_html(db_pois=None, suggested_pois=None):
+    """Render source-colored POI badges for the internal editor."""
+    badges = []
+    for poi in db_pois or []:
+        label = clean_text(poi.get("name_cn")) or clean_text(poi.get("name_en")) or clean_text(poi.get("poi_id"))
+        if label:
+            badges.append(f'<span class="poi-source-badge db">已入库 · {html.escape(label)}</span>')
+    for poi in suggested_pois or []:
+        if isinstance(poi, str):
+            label = clean_text(poi)
+        else:
+            label = clean_text(poi.get("name")) or clean_text(poi.get("name_en")) or clean_text(poi.get("title"))
+        if label:
+            badges.append(f'<span class="poi-source-badge ai">AI建议 · 未入库 · {html.escape(label)}</span>')
+    if not badges:
+        return ""
+    return '<div class="poi-source-badges">' + "".join(badges) + "</div>"
+
+
 def poi_price_range(poi):
     """Format a POI cost range for display and PPT output."""
     currency = clean_text(poi.get("currency")) or "CNY"
@@ -1027,6 +1220,8 @@ def generated_theme(day_number, total_days, city):
         return "Business & Local Visit"
     if "shanghai" in city_lower:
         return "City Experience & Recovery"
+    if "guangzhou" in city_lower:
+        return "Business & Innovation Visit"
     return "Curated Local Experience"
 
 
@@ -1092,9 +1287,11 @@ def route_day_profile(day_number, total_days, city, requirements):
             "max_pois": 1,
             "max_hours": 3,
         }
-    if day_number == 2 or ("医疗体检" in preference_tags and day_number <= max(3, total_days // 2)):
+    medical_day = 2 if total_days > 2 else 1
+    needs_medical = "医疗体检" in preference_tags or customer_type in ["康养客户", "综合客户"]
+    if needs_medical and day_number == medical_day:
         return {
-            "theme": "Medical Consultation & Recovery",
+            "theme": "Group Health Checkup & Recovery",
             "categories": ["医疗机构", "体检", "康养体验", "餐厅", "餐费", "交通", "服务标准"],
             "tags": ["医疗", "体检", "康养", "轻体力", "室内", "健康餐"],
             "max_pois": 2,
@@ -1131,8 +1328,8 @@ def generic_client_arrangement(day_number, total_days, city, theme):
         return f"Arrive in {city} with coordinated reception, private transfer, hotel check-in, and a welcome briefing."
     if day_number == total_days:
         return f"Prepare for departure with light arrangements, flexible leisure time, and private transfer support."
-    if "Medical" in theme or "Consultation" in theme:
-        return f"Coordinate medical consultation and recovery-friendly support in {city}, with private transfer and local assistance."
+    if any(word in theme for word in ["Medical", "Consultation", "Health Checkup", "Screening"]):
+        return f"Coordinated health checkups for all travelers in {city}, with bilingual support, private transfers, and recovery-friendly arrangements."
     if "Business" in theme or "Innovation" in theme:
         return f"Explore {city}'s business and innovation landscape through curated visits and local host support."
     if "Wellness" in theme or "Recovery" in theme:
@@ -1152,8 +1349,8 @@ def build_arrangement_from_pois(day_number, total_days, city, theme, selected_po
             return f"Arrive in {city} with coordinated reception and a gentle welcome program featuring {name_text}."
         if day_number == total_days:
             return f"Prepare for departure with light arrangements around {name_text}, keeping the schedule relaxed and flexible."
-        if "Medical" in theme:
-            return f"Coordinate medical and recovery-friendly arrangements in {city}, including {name_text}, with private transfer and local support."
+        if any(word in theme for word in ["Medical", "Consultation", "Health Checkup", "Screening"]):
+            return f"Coordinate group health checkups for all travelers in {city}, including {name_text}, with bilingual support, private transfers, and recovery-friendly arrangements."
         if "Business" in theme:
             return f"Explore {city}'s business and innovation landscape through curated visits including {name_text}."
         if "Wellness" in theme:
@@ -1178,14 +1375,10 @@ def score_poi_for_day(poi, city, profile, requirements, used_ids):
     excluded = requirements.get("excludedCategories") or []
     if any(clean_text(item) and (item == category or keyword_hit(text_bundle, [item])) for item in excluded):
         return -999
+    if not poi_allowed_for_city(poi, city):
+        return -999
 
-    score = 0
-    if city_matches(poi_city, city):
-        score += 60
-    elif poi_city == "通用":
-        score += 8
-    elif poi_city:
-        score -= 15
+    score = 60
 
     profile_category_match = keyword_hit(category, profile.get("categories", [])) or keyword_hit(text_bundle, profile.get("categories", []))
     if profile_category_match:
@@ -1251,19 +1444,6 @@ def select_pois_for_day(poi_records, city, profile, requirements, used_ids):
             total_hours += duration
             used_ids.add(clean_text(poi.get("poi_id")))
 
-    # Fallback pass allows non-city/global POIs only when city POIs are insufficient.
-    for _, poi in scored:
-        if len(selected) >= max_pois:
-            break
-        poi_id = clean_text(poi.get("poi_id"))
-        if poi_id in used_ids or poi_id in [clean_text(item.get("poi_id")) for item in selected]:
-            continue
-        duration = optional_number(poi.get("duration_hours")) or 1.0
-        if total_hours + duration <= max_hours or not selected:
-            selected.append(poi)
-            total_hours += duration
-            used_ids.add(poi_id)
-
     return selected
 
 
@@ -1312,12 +1492,478 @@ def generateRouteTemplateFromRequirements(requirements, poiDatabase):
         day_pois.append(selected)
         day_poi_ids.append([clean_text(poi.get("poi_id")) for poi in selected if clean_text(poi.get("poi_id"))])
 
+    rows, day_poi_ids = validate_generated_route(rows, day_poi_ids, poiDatabase, requirements)
+    day_pois = [selected_poi_records(poiDatabase, ids) for ids in day_poi_ids] if hasattr(poiDatabase, "iterrows") else day_pois
     return {
         "days": rows,
         "dayPoiIds": day_poi_ids,
         "dayPois": day_pois,
         "pricingPreview": calculate_route_pricing_preview(day_pois),
     }
+
+
+
+def deepseek_api_key():
+    """Read DeepSeek API key from Streamlit secrets or environment variables."""
+    try:
+        key = st.secrets.get("DEEPSEEK_API_KEY", "")
+        if key:
+            key = str(key).strip()
+        else:
+            key = ""
+    except Exception:
+        key = ""
+    if not key:
+        key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    placeholder_words = ["你的", "your", "api key", "sk-xxxx", "填入"]
+    if any(word in key.lower() for word in placeholder_words):
+        return ""
+    try:
+        key.encode("ascii")
+    except UnicodeEncodeError:
+        return ""
+    return key
+
+
+def call_deepseek_json(system_prompt, user_prompt, fallback=None):
+    """Call DeepSeek through its OpenAI-compatible chat endpoint and parse JSON output."""
+    key = deepseek_api_key()
+    if not key:
+        return fallback
+    payload = {
+        "model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.35,
+        "response_format": {"type": "json_object"},
+    }
+    request = urllib.request.Request(
+        "https://api.deepseek.com/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "{}")
+        return json.loads(content)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, UnicodeEncodeError, json.JSONDecodeError, KeyError) as exc:
+        st.warning(f"DeepSeek 调用失败，已使用本地规则生成：{exc}")
+        return fallback
+
+
+def ordered_city_mentions(text_value):
+    """Return route cities in the order they appear in the user's natural-language request."""
+    source = clean_text(text_value)
+    lower_source = source.lower()
+    city_candidates = [
+        ("Shanghai", ["上海", "shanghai"]),
+        ("Hangzhou", ["杭州", "hangzhou"]),
+        ("Yiwu", ["义乌", "yiwu"]),
+        ("Guangzhou", ["广州", "guangzhou"]),
+    ]
+    hits = []
+    for city, keys in city_candidates:
+        positions = []
+        for key in keys:
+            haystack = lower_source if key.isascii() else source
+            needle = key.lower() if key.isascii() else key
+            position = haystack.find(needle)
+            if position >= 0:
+                positions.append(position)
+        if positions:
+            hits.append((min(positions), city))
+    return [city for _, city in sorted(hits, key=lambda item: item[0])]
+
+
+def move_city_block_to_front(proposal, city_name):
+    """Move all days for a city to the front while preserving each city's internal order."""
+    target_key = city_key(city_name)
+    if not target_key:
+        return proposal
+    itinerary = proposal.get("itinerary") or []
+    front = [day for day in itinerary if city_key(day.get("city")) == target_key]
+    rest = [day for day in itinerary if city_key(day.get("city")) != target_key]
+    if not front:
+        return proposal
+    proposal["itinerary"] = front + rest
+    proposal["selected_pois"] = [day.get("poi_ids") or [] for day in proposal["itinerary"]]
+    return proposal
+
+
+def requested_day_count(text_value):
+    """Extract intended total trip days, prioritizing explicit trip-duration wording."""
+    text_value = clean_text(text_value)
+    patterns = [
+        r"(?:一共|总共|总计|共|整体|全程|还是|保持|控制在|不要超过)\s*(\d+)\s*天",
+        r"(\d+)\s*天\s*(?:行程|旅程|线路|旅行|游玩)",
+        r"(?:行程|旅程|线路|旅行|游玩)\s*(?:一共|总共|共|是|为)?\s*(\d+)\s*天",
+        r"(\d+)\s*(?:days?|day)",
+        r"(\d+)\s*天",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text_value, flags=re.I)
+        if match:
+            try:
+                return int(match.group(1))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def enforce_proposal_day_count(proposal, target_days, protected_cities=None, poi_database=None, requirements=None):
+    """Resize itinerary to the requested total day count while protecting newly requested cities and medical days."""
+    if not target_days or target_days <= 0:
+        return proposal
+    itinerary = proposal.get("itinerary") or []
+    protected_keys = {city_key(city) for city in (protected_cities or []) if city_key(city)}
+
+    def is_protected(day):
+        return city_key(day.get("city")) in protected_keys or is_medical_theme(day.get("theme"))
+
+    while len(itinerary) > target_days:
+        removable_index = None
+        for index in range(len(itinerary) - 1, -1, -1):
+            if not is_protected(itinerary[index]):
+                removable_index = index
+                break
+        if removable_index is None:
+            removable_index = len(itinerary) - 1
+        itinerary.pop(removable_index)
+
+    while len(itinerary) < target_days:
+        city = clean_text(itinerary[-1].get("city")) if itinerary else "Hangzhou"
+        itinerary.append(create_city_itinerary_day(city, itinerary, requirements or {}, poi_database))
+
+    for index, day in enumerate(itinerary, start=1):
+        day["day"] = index
+    proposal["itinerary"] = itinerary
+    proposal["selected_pois"] = [day.get("poi_ids") or [] for day in itinerary]
+    return proposal
+
+
+def create_city_itinerary_day(city_name, itinerary, requirements, poi_database):
+    """Create one itinerary day for an added city during conversational revision."""
+    city = clean_text(city_name)
+    day_number = len(itinerary) + 1
+    total_days = day_number
+    profile = route_day_profile(day_number, total_days, city, requirements or {})
+    if profile.get("theme") in ["Departure Preparation", "Arrival & Welcome"]:
+        profile["theme"] = generated_theme(max(2, day_number - 1), max(3, total_days + 1), city)
+    poi_records = poi_database.to_dict("records") if hasattr(poi_database, "to_dict") else (poi_database or [])
+    used_ids = {clean_text(poi_id) for day in itinerary for poi_id in (day.get("poi_ids") or []) if clean_text(poi_id)}
+    selected = select_pois_for_day(poi_records, city, profile, requirements or {}, used_ids)
+    theme = profile.get("theme") or generated_theme(max(2, day_number), max(3, total_days + 1), city)
+    arrangement = build_arrangement_from_pois(day_number, total_days, city, theme, selected)
+    poi_ids = [clean_text(poi.get("poi_id")) for poi in selected if clean_text(poi.get("poi_id"))]
+    return {
+        "day": day_number,
+        "city": city,
+        "theme": theme,
+        "description": arrangement,
+        "poi_ids": poi_ids,
+        "suggested_pois": [] if poi_ids else suggested_pois_for_day(city, theme),
+        "medical": "group" if is_medical_theme(theme) else "",
+        "notes": "AI added during conversational revision",
+    }
+
+
+def add_city_day_to_proposal(proposal, city_name, requirements, poi_database):
+    """Add a new city day before departure when the user asks to add a destination."""
+    itinerary = proposal.get("itinerary") or []
+    city = clean_text(city_name)
+    new_day = create_city_itinerary_day(city, itinerary, requirements, poi_database)
+    insert_index = len(itinerary)
+    if itinerary and keyword_hit(clean_text(itinerary[-1].get("theme")), ["Departure", "离境", "返程"]):
+        insert_index = max(len(itinerary) - 1, 0)
+    itinerary.insert(insert_index, new_day)
+    proposal["itinerary"] = itinerary
+    proposal["selected_pois"] = [day.get("poi_ids") or [] for day in itinerary]
+    return proposal
+
+
+def infer_requirements_from_text(user_requirements, filters):
+    """Extract basic structured requirements from natural language plus sidebar filters."""
+    text_value = clean_text(user_requirements)
+    lower = text_value.lower()
+    inferred = dict(filters or {})
+    inferred["raw_user_input"] = text_value
+
+    extracted_days = requested_day_count(text_value)
+    if extracted_days:
+        inferred["days"] = extracted_days
+        inferred["nights"] = max(extracted_days - 1, 0)
+    people_match = re.search(r"(\d+)\s*(?:个人|人|位|traveler|travelers|guests?)", text_value, flags=re.I)
+    if people_match:
+        inferred["customerCount"] = int(people_match.group(1))
+
+    mentioned_cities = ordered_city_mentions(text_value)
+    if mentioned_cities:
+        inferred["cities"] = mentioned_cities
+        inferred["routeCities"] = ", ".join(mentioned_cities)
+
+    preference_tags = list(inferred.get("preferenceTags") or [])
+    for keyword, tag in [
+        ("体检", "医疗体检"), ("医疗", "医疗体检"), ("康养", "康养"),
+        ("科技", "科技"), ("商务", "商务"), ("文化", "文化"),
+        ("西湖", "文化"), ("轻松", "轻体力"), ("不要太累", "轻体力"),
+        ("高端", "高端"), ("亲子", "亲子"),
+    ]:
+        if keyword in text_value and tag not in preference_tags:
+            preference_tags.append(tag)
+    inferred["preferenceTags"] = preference_tags
+
+    if "科技" in text_value and "商务" not in text_value:
+        inferred["customerType"] = "科技考察客户"
+    if "康养" in text_value or "不要太累" in text_value or "轻松" in text_value:
+        inferred["intensityLevel"] = "轻松"
+    if "家庭" in text_value or "亲子" in text_value:
+        inferred["customerType"] = "家庭客户"
+    if "商务" in text_value:
+        inferred["customerType"] = "商务客户"
+
+    if "科技企业" in text_value:
+        required = list(inferred.get("requiredCategories") or [])
+        if "科技企业" not in required:
+            required.append("科技企业")
+        inferred["requiredCategories"] = required
+    return inferred
+
+
+def requirement_summary(requirements):
+    """Build a Chinese summary for the optional constraint sidebar."""
+    req = requirements or {}
+    rows = []
+    mapping = [
+        ("raw_user_input", "原始需求"),
+        ("customerCount", "出行人数"),
+        ("days", "出行天数"),
+        ("routeCities", "城市范围"),
+        ("customerType", "客户类型"),
+        ("intensityLevel", "行程强度"),
+        ("preferenceTags", "偏好标签"),
+        ("requiredCategories", "必须包含"),
+        ("excludedCategories", "不希望包含"),
+        ("budgetNote", "预算说明"),
+    ]
+    for key, label in mapping:
+        value = req.get(key)
+        if isinstance(value, list):
+            value = "、".join(clean_text(item) for item in value if clean_text(item))
+        value = clean_text(value)
+        if value:
+            rows.append(f"- {label}：{value}")
+    return "\n".join(rows) or "尚未识别。请先在右侧输入客户自然语言需求。"
+
+
+def proposal_from_route_template(requirements, route_template, intro_text):
+    """Create the unified current_proposal object from generated route data."""
+    itinerary = []
+    day_ids = route_template.get("dayPoiIds") or []
+    for index, row in enumerate(route_template.get("days") or [], start=1):
+        current_ids = day_ids[index - 1] if index - 1 < len(day_ids) else []
+        city = clean_text(row.get("City"))
+        theme = clean_text(row.get("Theme"))
+        itinerary.append({
+            "day": index,
+            "city": city,
+            "theme": theme,
+            "description": clean_text(row.get("Arrangement")),
+            "poi_ids": current_ids,
+            "suggested_pois": [] if current_ids else suggested_pois_for_day(city, theme),
+            "medical": "group" if is_medical_theme(row.get("Theme")) else "",
+            "notes": "",
+        })
+    return {
+        "proposal_title": clean_text(requirements.get("title")) or "Premium Medical Tourism Proposal",
+        "proposal_intro": clean_text(intro_text) or "A premium health travel proposal with coordinated medical support and curated local experiences.",
+        "client_profile": {
+            "customer_count": int(requirements.get("customerCount") or 1),
+            "customer_type": clean_text(requirements.get("customerType")),
+            "requirements_text": clean_text(requirements.get("requirementsText")),
+            "intensity_level": clean_text(requirements.get("intensityLevel")),
+        },
+        "itinerary": itinerary,
+        "medical_plan": "Group health checkups for all travelers should be arranged on the same medical day unless special requirements require otherwise.",
+        "selected_pois": day_ids,
+        "service_inclusions": "Private airport transfers\nMedical appointment coordination\nLocal host and translation support\nCurated sightseeing arrangements",
+        "cost_notes": clean_text(requirements.get("clientQuote")) or "To be confirmed",
+        "next_steps": "Confirm travel dates\nConfirm health checkup package\nConfirm hotel preference\nFinalize quotation",
+        "export_settings": {"output_language": "en"},
+        "locked_modules": [],
+    }
+
+
+def proposal_to_session_state(proposal, pricing_preview=None):
+    """Sync current_proposal into existing Streamlit state used by editors and exports."""
+    proposal = ensure_proposal_suggested_pois(proposal)
+    itinerary = proposal.get("itinerary") or []
+    rows = []
+    day_ids = []
+    day_suggested = []
+    for index, day in enumerate(itinerary, start=1):
+        rows.append({
+            "Day": index,
+            "City": clean_text(day.get("city")),
+            "Theme": clean_text(day.get("theme")),
+            "Arrangement": clean_text(day.get("description")),
+        })
+        day_ids.append(day.get("poi_ids") or [])
+        day_suggested.append(day.get("suggested_pois") or [])
+    st.session_state.current_proposal = proposal
+    st.session_state.generated_intro = clean_text(proposal.get("proposal_intro"))
+    st.session_state.itinerary_rows = rows
+    st.session_state.day_poi_ids = day_ids
+    st.session_state.day_suggested_pois = day_suggested
+    if pricing_preview is not None:
+        st.session_state.route_pricing_preview = pricing_preview
+    st.session_state.generationStatus = "completed"
+    st.session_state.generation_error = ""
+    st.session_state.draft_version += 1
+
+
+def sync_current_proposal_from_session():
+    """Keep current_proposal aligned with manual edits in the structured editor."""
+    proposal = st.session_state.get("current_proposal") or {}
+    itinerary = []
+    for index, row in enumerate(itinerary_records(st.session_state.get("itinerary_rows", [])), start=1):
+        ids = st.session_state.day_poi_ids[index - 1] if index - 1 < len(st.session_state.get("day_poi_ids", [])) else []
+        suggested = st.session_state.day_suggested_pois[index - 1] if index - 1 < len(st.session_state.get("day_suggested_pois", [])) else []
+        itinerary.append({
+            "day": index,
+            "city": clean_text(row.get("City")),
+            "theme": clean_text(row.get("Theme")),
+            "description": clean_text(row.get("Arrangement")),
+            "poi_ids": ids,
+            "suggested_pois": [] if ids else suggested_pois_for_day(row.get("City"), row.get("Theme")) if not suggested else suggested,
+            "medical": "group" if is_medical_theme(row.get("Theme")) else "",
+            "notes": "",
+        })
+    proposal["proposal_intro"] = st.session_state.get("generated_intro", proposal.get("proposal_intro", ""))
+    proposal["itinerary"] = itinerary
+    proposal["selected_pois"] = st.session_state.get("day_poi_ids", [])
+    st.session_state.current_proposal = proposal
+    return proposal
+
+
+def append_proposal_version(label):
+    """Save a lightweight version snapshot."""
+    history = st.session_state.setdefault("proposal_versions", [])
+    snapshot = json.loads(json.dumps(st.session_state.get("current_proposal") or {}, ensure_ascii=False))
+    history.append({"label": label, "proposal": snapshot, "time": time.strftime("%H:%M:%S")})
+
+
+def generate_initial_proposal(user_requirements, filters, poi_database):
+    """Generate first proposal version from natural language and sidebar filters."""
+    inferred = infer_requirements_from_text(user_requirements, filters)
+    inferred["requirementsText"] = user_requirements
+    llm_result = call_deepseek_json(
+        "You are a medical tourism proposal planner. Return JSON only with optional keys: proposal_title, proposal_intro, customer_type, intensity_level.",
+        json.dumps({"user_requirements": user_requirements, "filters": inferred}, ensure_ascii=False),
+        fallback={},
+    ) or {}
+    if clean_text(llm_result.get("proposal_title")):
+        inferred["title"] = clean_text(llm_result.get("proposal_title"))
+    if clean_text(llm_result.get("customer_type")):
+        inferred["customerType"] = clean_text(llm_result.get("customer_type"))
+    if clean_text(llm_result.get("intensity_level")):
+        inferred["intensityLevel"] = clean_text(llm_result.get("intensity_level"))
+    intro_text = clean_text(llm_result.get("proposal_intro")) or clean_text(filters.get("intro"))
+    route_template = generateRouteTemplateFromRequirements(inferred, poi_database)
+    proposal = proposal_from_route_template(inferred, route_template, intro_text)
+    return proposal, route_template
+
+
+def revise_proposal(current_proposal, user_instruction, filters, poi_database):
+    """Revise current proposal in place according to a follow-up natural-language instruction."""
+    proposal = json.loads(json.dumps(current_proposal or {}, ensure_ascii=False))
+    instruction = clean_text(user_instruction)
+    target_days = requested_day_count(instruction) or int((filters or {}).get("days") or len(proposal.get("itinerary") or []) or 0)
+    itinerary = proposal.get("itinerary") or []
+    locked = set(proposal.get("locked_modules") or [])
+
+    if "proposal_intro" not in locked and any(word in instruction for word in ["简介", "高级", "高端", "更好", "优化英文"]):
+        fallback_intro = "This premium health travel proposal combines coordinated medical checkups, attentive bilingual support, private transfers, and curated city experiences designed for a smooth and confidence-building journey."
+        llm_result = call_deepseek_json(
+            "Return JSON only with key proposal_intro. Write polished English client-facing copy, no Chinese.",
+            json.dumps({"current_intro": proposal.get("proposal_intro"), "instruction": instruction}, ensure_ascii=False),
+            fallback={"proposal_intro": fallback_intro},
+        ) or {}
+        proposal["proposal_intro"] = clean_text(llm_result.get("proposal_intro")) or fallback_intro
+
+    if "itinerary" not in locked:
+        added_city_requests = ordered_city_mentions(instruction)
+        if added_city_requests and any(word in instruction for word in ["增加", "加入", "添加", "安排", "加上", "去"]):
+            for city_name in added_city_requests:
+                proposal = add_city_day_to_proposal(proposal, city_name, filters, poi_database)
+            itinerary = proposal.get("itinerary") or []
+        if "义乌减少一天" in instruction or ("义乌" in instruction and "减少" in instruction):
+            yiwu_indices = [i for i, day in enumerate(itinerary) if "yiwu" in clean_text(day.get("city")).lower()]
+            if len(yiwu_indices) > 1:
+                itinerary.pop(yiwu_indices[-1])
+        if "西湖" in instruction:
+            target = next((day for day in itinerary if "hangzhou" in clean_text(day.get("city")).lower() and not is_medical_theme(day.get("theme"))), None)
+            if target is None:
+                target = {"city": "Hangzhou", "theme": "West Lake Cultural Experience", "description": "Enjoy a relaxed West Lake cultural experience with light walking, scenic moments, and local concierge support.", "poi_ids": [], "medical": "", "notes": ""}
+                itinerary.insert(min(2, len(itinerary)), target)
+            target["theme"] = "West Lake Cultural Experience"
+            target["description"] = "Enjoy a relaxed West Lake cultural experience with light walking, scenic views, and recovery-friendly local support."
+        if any(word in instruction for word in ["不想太商务", "更轻松", "不要太累", "轻松一点"]):
+            for day in itinerary:
+                if "Business" in clean_text(day.get("theme")) and "科技" not in instruction:
+                    day["theme"] = "Light Cultural & Wellness Experience"
+                    day["description"] = f"Enjoy a relaxed day in {day.get('city')}, with light cultural experiences, comfortable pacing, and local concierge support."
+        if "体检" in instruction and any(word in instruction for word in ["同一天", "一起", "并行", "两个人", "2个人"]):
+            medical_days = [day for day in itinerary if is_medical_theme(day.get("theme"))]
+            if not medical_days and itinerary:
+                medical_days = [itinerary[min(1, len(itinerary) - 1)]]
+            if medical_days:
+                primary = medical_days[0]
+                primary["theme"] = "Group Health Checkup & Recovery"
+                primary["medical"] = "group"
+                primary["description"] = f"Coordinated health checkups for all travelers in {primary.get('city')}, with bilingual support, private transfers, and recovery-friendly arrangements."
+                for duplicate in medical_days[1:]:
+                    duplicate["theme"] = "Wellness & Local Experience"
+                    duplicate["medical"] = ""
+                    duplicate["description"] = f"Enjoy a relaxed recovery-friendly day in {duplicate.get('city')}, with light local experiences and concierge support."
+        day_match = re.search(r"day\s*(\d+)|第\s*(\d+)\s*天", instruction, flags=re.I)
+        if day_match and any(word in instruction for word in ["重写", "修改", "调整", "rewrite"]):
+            day_no = int(day_match.group(1) or day_match.group(2))
+            if 1 <= day_no <= len(itinerary):
+                day = itinerary[day_no - 1]
+                day["description"] = f"A refined, client-friendly day in {day.get('city')} adjusted according to the latest consultant instruction: {instruction}"
+
+    first_city_match = re.search(r"(?:先到|先去|先飞到|飞到|从|第一站|先).*?(上海|杭州|义乌|广州|Shanghai|Hangzhou|Yiwu|Guangzhou)", instruction, flags=re.I)
+    if first_city_match:
+        proposal["itinerary"] = itinerary
+        proposal = move_city_block_to_front(proposal, first_city_match.group(1))
+        itinerary = proposal.get("itinerary") or []
+
+    proposal["itinerary"] = itinerary
+    proposal = enforce_proposal_day_count(proposal, target_days, protected_cities=ordered_city_mentions(instruction), poi_database=poi_database, requirements=filters)
+    itinerary = proposal.get("itinerary") or []
+    rows = [{"Day": i + 1, "City": day.get("city"), "Theme": day.get("theme"), "Arrangement": day.get("description")} for i, day in enumerate(itinerary)]
+    ids = [day.get("poi_ids") or [] for day in itinerary]
+    rows, ids = validate_generated_route(rows, ids, poi_database, filters)
+    existing_suggested = [day.get("suggested_pois") or [] for day in itinerary]
+    proposal["itinerary"] = [
+        {
+            "day": row.get("Day"),
+            "city": row.get("City"),
+            "theme": row.get("Theme"),
+            "description": row.get("Arrangement"),
+            "poi_ids": ids[index] if index < len(ids) else [],
+            "suggested_pois": [] if (index < len(ids) and ids[index]) else (existing_suggested[index] if index < len(existing_suggested) and existing_suggested[index] else suggested_pois_for_day(row.get("City"), row.get("Theme"))),
+            "medical": "group" if is_medical_theme(row.get("Theme")) else "",
+            "notes": "",
+        }
+        for index, row in enumerate(rows)
+    ]
+    proposal["selected_pois"] = ids
+    return proposal
 
 
 def generate_itinerary_from_basics(days, route_cities):
@@ -2643,6 +3289,8 @@ if main_nav == "方案生成":
         st.session_state.draft_version = 0
     if "day_poi_ids" not in st.session_state:
         st.session_state.day_poi_ids = []
+    if "day_suggested_pois" not in st.session_state:
+        st.session_state.day_suggested_pois = []
     if "route_pricing_preview" not in st.session_state:
         st.session_state.route_pricing_preview = {}
     if "pdf_draft" not in st.session_state:
@@ -2655,17 +3303,28 @@ if main_nav == "方案生成":
         st.session_state.customer_pdf_bytes = None
     if "pdf_draft_version" not in st.session_state:
         st.session_state.pdf_draft_version = 0
+    if "current_proposal" not in st.session_state:
+        st.session_state.current_proposal = None
+    if "proposal_messages" not in st.session_state:
+        st.session_state.proposal_messages = []
+    if "proposal_versions" not in st.session_state:
+        st.session_state.proposal_versions = []
+    if "current_requirements" not in st.session_state:
+        st.session_state.current_requirements = {}
 
     with st.sidebar:
-        st.header("方案基础信息")
-        title = st.text_input("英文方案标题", "Premium Medical Tourism Proposal")
-        group_size = st.number_input("客户人数", min_value=1, value=4, step=1)
-        days = st.number_input("天数", min_value=1, value=7, step=1)
-        nights = st.number_input("晚数", min_value=0, value=6, step=1)
-        route_cities = st.text_input("英文路线城市", "Hangzhou, Yiwu, Shanghai")
+        st.header("方案约束设置（可选）")
+        st.caption("主输入入口在右侧客户需求对话区；这里仅用于查看识别结果和手动补充约束。")
+        with st.expander("已识别客户需求摘要", expanded=True):
+            st.markdown(requirement_summary(st.session_state.current_requirements))
+        title = st.text_input("英文方案标题（可选）", "Premium Medical Tourism Proposal")
+        group_size = st.number_input("出行人数（可选）", min_value=1, value=4, step=1)
+        days = st.number_input("出行天数（可选）", min_value=1, value=7, step=1)
+        nights = st.number_input("晚数（可选）", min_value=0, value=6, step=1)
+        route_cities = st.text_input("城市范围（可选）", "Hangzhou, Yiwu, Shanghai")
         budget_min = st.text_input("客户预算下限（USD，可选）", "")
         budget_max = st.text_input("客户预算上限（USD，可选）", "")
-        budget_notes = st.text_area("预算备注（可选）", "暂无明确预算，先生成标准版方案", height=90)
+        budget_notes = st.text_area("预算备注（可选）", "", height=80)
         client_quote_input = st.text_input(
             "客户展示报价（可选）",
             "",
@@ -2688,13 +3347,8 @@ if main_nav == "方案生成":
             "不希望包含的点位类型（可选）",
             ["夜游", "强步行", "户外", "商务参访", "科技企业", "餐厅"],
         )
-        intro_input = st.text_area(
-            "英文方案简介",
-            "This proposal outlines a private medical tourism journey combining coordinated healthcare support, premium accommodation, local transfers, and curated leisure time for a smooth client experience.",
-            height=130,
-        )
-        st.divider()
-        generate_draft_clicked = st.button("确定并生成方案初稿", type="primary", use_container_width=True)
+        intro_input = ""
+        generate_draft_clicked = False
 
     current_basics_key = proposal_basics_key(
         title,
@@ -2713,12 +3367,64 @@ if main_nav == "方案生成":
         required_categories,
         excluded_categories,
     )
-    if (
-        st.session_state.generationStatus == "completed"
-        and st.session_state.generated_source_key
-        and current_basics_key != st.session_state.generated_source_key
-    ):
-        st.session_state.generationStatus = "stale"
+    # 左侧现在只是可选约束设置，不再因为约束微调自动覆盖或标记当前方案过期。
+
+    st.subheader("客户需求对话区")
+    st.caption("这是方案生成的主入口。可以完全不填左侧，直接输入客户自然语言需求；生成后继续输入调整方向即可迭代当前方案。")
+    with st.container(border=True):
+        for message in st.session_state.proposal_messages[-6:]:
+            role_label = "顾问" if message.get("role") == "user" else "系统"
+            st.markdown(f"**{role_label}：** {message.get('content', '')}")
+        dialogue_placeholder = "例如：客户是2个人，想做体检，也想参观杭州科技企业，7天，不要太累，预算中高。"
+        dialogue_input = st.text_area("客户需求 / 调整指令", "", height=105, placeholder=dialogue_placeholder, key=f"proposal_dialogue_input_{st.session_state.draft_version}")
+        col_chat_1, col_chat_2 = st.columns([1.2, 2.4])
+        with col_chat_1:
+            dialogue_action = "生成第一版方案" if not st.session_state.current_proposal else "根据当前方案继续调整"
+            dialogue_clicked = st.button(dialogue_action, type="primary", disabled=not clean_text(dialogue_input))
+
+    dialogue_filters = {
+        "title": title,
+        "customerCount": int(group_size),
+        "days": int(days),
+        "nights": int(nights),
+        "routeCities": route_cities,
+        "cities": parse_route_cities(route_cities),
+        "budgetMin": budget_min,
+        "budgetMax": budget_max,
+        "budgetNote": budget_notes,
+        "clientQuote": client_quote_input,
+        "customerType": customer_type,
+        "preferenceTags": preference_tags,
+        "intensityLevel": intensity_level,
+        "requiredCategories": required_categories,
+        "excludedCategories": excluded_categories,
+        "intro": intro_input,
+    }
+    if dialogue_clicked:
+        try:
+            st.session_state.proposal_messages.append({"role": "user", "content": dialogue_input})
+            if st.session_state.current_proposal:
+                sync_current_proposal_from_session()
+                base_requirements = st.session_state.current_requirements or dialogue_filters
+                extracted_requirements = infer_requirements_from_text(dialogue_input, base_requirements)
+                st.session_state.current_requirements = {**base_requirements, **extracted_requirements}
+                revised = revise_proposal(st.session_state.current_proposal, dialogue_input, st.session_state.current_requirements, active_poi_df)
+                proposal_to_session_state(revised)
+                append_proposal_version(f"迭代：{shorten_client_text(dialogue_input, 28)}")
+                st.session_state.proposal_messages.append({"role": "assistant", "content": "已基于当前方案完成迭代修改，并同步到右侧方案草稿。"})
+            else:
+                extracted_requirements = infer_requirements_from_text(dialogue_input, dialogue_filters)
+                st.session_state.current_requirements = extracted_requirements
+                proposal, route_template = generate_initial_proposal(dialogue_input, extracted_requirements, active_poi_df)
+                proposal_to_session_state(proposal, route_template.get("pricingPreview"))
+                st.session_state.generated_source_key = current_basics_key
+                append_proposal_version("v1 初始生成")
+                st.session_state.proposal_messages.append({"role": "assistant", "content": "已生成第一版结构化方案草稿，可继续输入调整方向。"})
+            st.rerun()
+        except Exception as exc:
+            st.session_state.generationStatus = "failed"
+            st.session_state.generation_error = f"对话生成失败：{exc}"
+            st.error(st.session_state.generation_error)
 
     if generate_draft_clicked:
         validation_errors = validate_proposal_basics(title, group_size, days, route_cities)
@@ -2755,27 +3461,25 @@ if main_nav == "方案生成":
     status = st.session_state.generationStatus
     status_label = generationStatusLabels.get(status, "未知状态")
     if status == "completed":
-        render_status_card("completed", f"方案生成状态：{status_label}", "右侧方案初稿已生成，可继续编辑并导出英文方案 PPT。")
+        render_status_card("completed", f"方案生成状态：{status_label}", "方案初稿已生成，你可以继续输入调整方向，系统会基于当前方案进行修改。")
     elif status == "generating":
         render_status_card("generating", f"方案生成状态：{status_label}", "正在根据左侧信息生成英文方案初稿，请稍候……")
     elif status == "failed":
         render_status_card("failed", f"方案生成状态：{status_label}", st.session_state.generation_error or "生成失败，请检查左侧输入。")
     elif status == "stale":
-        render_status_card("stale", "方案生成状态：左侧信息已修改，请重新生成", "左侧方案基础信息已发生变化。请点击「确定并生成方案初稿」重新生成右侧内容，或继续使用当前已生成内容。")
+        render_status_card("stale", "方案生成状态：方案约束已调整", "可继续使用当前方案，也可以在客户需求对话区输入调整方向进行迭代。")
     else:
-        render_status_card("idle", "方案生成状态：未生成", "请先在左侧填写方案基础信息，然后点击「确定并生成方案初稿」。")
+        render_status_card("idle", "方案生成状态：未生成", "请输入客户需求，系统将生成第一版方案。")
 
     if status == "generating" and st.session_state.get("pending_generation"):
         time.sleep(0.7)
         try:
             pending = st.session_state.pending_generation
             route_template = generateRouteTemplateFromRequirements(pending["requirements"], active_poi_df)
-            st.session_state.generated_intro = pending["intro"]
-            st.session_state.itinerary_rows = route_template["days"]
-            st.session_state.day_poi_ids = route_template["dayPoiIds"]
-            st.session_state.route_pricing_preview = route_template["pricingPreview"]
+            proposal = proposal_from_route_template(pending["requirements"], route_template, pending["intro"])
+            proposal_to_session_state(proposal, route_template["pricingPreview"])
+            append_proposal_version("表单生成方案初稿")
             st.session_state.generated_source_key = pending["source_key"]
-            st.session_state.draft_version += 1
             st.session_state.generationStatus = "completed"
             st.session_state.generation_error = ""
             st.session_state.pending_generation = None
@@ -2798,19 +3502,89 @@ if main_nav == "方案生成":
         st.session_state.generated_intro = generated_intro
 
         st.subheader("英文行程安排")
-        itinerary = st.data_editor(
-            st.session_state.itinerary_rows,
-            num_rows="dynamic",
-            use_container_width=True,
-            column_config={
-                "Day": st.column_config.NumberColumn("天数", min_value=1, step=1),
-                "City": st.column_config.TextColumn("英文城市"),
-                "Theme": st.column_config.TextColumn("英文主题"),
-                "Arrangement": st.column_config.TextColumn("英文行程安排"),
-            },
-            key=f"itinerary_editor_{st.session_state.draft_version}",
-        )
-        st.session_state.itinerary_rows = itinerary_records(itinerary)
+        st.caption("可直接拖动表格最左侧手柄调整每天顺序；拖拽后系统会自动重排 Day 编号，并同步每日点位选择与导出顺序。")
+        editor_rows = []
+        for row_index, row in enumerate(st.session_state.itinerary_rows):
+            editor_row = dict(row)
+            editor_row["拖拽"] = "☰"
+            editor_row["_row_id"] = row_index
+            editor_rows.append(editor_row)
+        try:
+            from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+            grid_df = pd.DataFrame(editor_rows)
+            grid_builder = GridOptionsBuilder.from_dataframe(grid_df)
+            grid_builder.configure_default_column(editable=True, resizable=True, wrapText=True, autoHeight=True)
+            grid_builder.configure_column("拖拽", header_name="", rowDrag=True, editable=False, width=54, pinned="left")
+            grid_builder.configure_column("Day", header_name="天数", editable=False, width=80)
+            grid_builder.configure_column("City", header_name="英文城市", width=150)
+            grid_builder.configure_column("Theme", header_name="英文主题", width=260)
+            grid_builder.configure_column("Arrangement", header_name="英文行程安排", width=620)
+            grid_builder.configure_column("_row_id", hide=True)
+            grid_options = grid_builder.build()
+            grid_options["rowDragManaged"] = True
+            grid_options["rowDragEntireRow"] = True
+            grid_options["animateRows"] = True
+            grid_options["suppressMoveWhenRowDragging"] = False
+            grid_response = AgGrid(
+                grid_df,
+                gridOptions=grid_options,
+                update_mode=GridUpdateMode.MODEL_CHANGED,
+                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                fit_columns_on_grid_load=False,
+                allow_unsafe_jscode=True,
+                update_on=["rowDragEnd", "cellValueChanged"],
+                height=min(620, 92 + 46 * max(len(editor_rows), 3)),
+                key=f"itinerary_drag_grid_{st.session_state.draft_version}",
+            )
+            edited_records = itinerary_records(grid_response.get("data", editor_rows))
+        except Exception as grid_exc:
+            st.warning(f"拖拽表格组件未启用：{grid_exc}。请先安装依赖：pip install streamlit-aggrid")
+            edited_records = itinerary_records(st.data_editor(
+                editor_rows,
+                num_rows="dynamic",
+                use_container_width=True,
+                column_order=["Day", "City", "Theme", "Arrangement"],
+                column_config={
+                    "Day": st.column_config.NumberColumn("天数", min_value=1, step=1, disabled=True),
+                    "City": st.column_config.TextColumn("英文城市"),
+                    "Theme": st.column_config.TextColumn("英文主题"),
+                    "Arrangement": st.column_config.TextColumn("英文行程安排"),
+                    "拖拽": None,
+                    "_row_id": None,
+                },
+                key=f"itinerary_editor_fallback_{st.session_state.draft_version}",
+            ))
+        itinerary = []
+        reordered_day_poi_ids = []
+        reordered_suggested_pois = []
+        for record in edited_records:
+            original_index = int(optional_number(record.get("_row_id")) or 0)
+            itinerary.append({
+                "Day": record.get("Day"),
+                "City": record.get("City"),
+                "Theme": record.get("Theme"),
+                "Arrangement": record.get("Arrangement"),
+            })
+            reordered_day_poi_ids.append(st.session_state.day_poi_ids[original_index] if original_index < len(st.session_state.day_poi_ids) else [])
+            reordered_suggested_pois.append(st.session_state.day_suggested_pois[original_index] if original_index < len(st.session_state.day_suggested_pois) else [])
+        old_order = list(range(len(st.session_state.itinerary_rows)))
+        new_order = [int(optional_number(record.get("_row_id")) or 0) for record in edited_records]
+        st.session_state.day_poi_ids = reordered_day_poi_ids
+        st.session_state.day_suggested_pois = reordered_suggested_pois
+        normalized_rows, normalized_day_poi_ids = normalize_itinerary_and_pois(itinerary_records(itinerary), st.session_state.day_poi_ids, active_poi_df)
+        st.session_state.itinerary_rows = normalized_rows
+        st.session_state.day_poi_ids = normalized_day_poi_ids
+        while len(st.session_state.day_suggested_pois) < len(normalized_rows):
+            idx = len(st.session_state.day_suggested_pois)
+            row = normalized_rows[idx]
+            st.session_state.day_suggested_pois.append(suggested_pois_for_day(row.get("City"), row.get("Theme")))
+        st.session_state.day_suggested_pois = st.session_state.day_suggested_pois[:len(normalized_rows)]
+        itinerary = normalized_rows
+        if new_order != old_order and len(new_order) == len(old_order):
+            sync_current_proposal_from_session()
+            st.session_state.draft_version += 1
+            st.toast("行程顺序已同步更新")
+            st.rerun()
     else:
         generated_intro = ""
         itinerary = []
@@ -2829,8 +3603,7 @@ if main_nav == "方案生成":
                 for _, poi_row in active_poi_df.iterrows()
                 if city_matches(poi_row.get("city"), city_label)
             }
-            other_poi_options = {label: poi_id for label, poi_id in poi_options.items() if poi_id not in set(city_poi_options.values())}
-            ordered_options = {**city_poi_options, **other_poi_options}
+            ordered_options = city_poi_options
             saved_ids = []
             if index - 1 < len(st.session_state.day_poi_ids):
                 saved_ids = st.session_state.day_poi_ids[index - 1]
@@ -2852,12 +3625,35 @@ if main_nav == "方案生成":
                 st.session_state.day_poi_ids.append(selected_ids)
             else:
                 st.session_state.day_poi_ids[index - 1] = selected_ids
+            if index - 1 >= len(st.session_state.day_suggested_pois):
+                st.session_state.day_suggested_pois.append([])
+            if selected_ids:
+                st.session_state.day_suggested_pois[index - 1] = []
+            elif not st.session_state.day_suggested_pois[index - 1]:
+                st.session_state.day_suggested_pois[index - 1] = suggested_pois_for_day(city_label, row.get("Theme"))
+            selected_db_pois = selected_poi_records(active_poi_df, selected_ids)
+            badge_html = poi_source_badges_html(selected_db_pois, st.session_state.day_suggested_pois[index - 1])
+            if badge_html:
+                st.markdown("<div class='poi-source-legend'>蓝色=点位库已有；橙色=AI 临时建议，建议后续补入点位库。</div>" + badge_html, unsafe_allow_html=True)
             if not selected_ids:
-                st.warning("当前城市暂无匹配 POI，请手动选择或补充点位库。")
+                if ordered_options:
+                    st.warning("当前天暂无自动入库点位，可从下拉框手动选择同城 POI；橙色标签为 AI 临时建议。")
+                else:
+                    st.warning("当前城市点位库暂无 POI；橙色标签为 AI 临时建议，请后续补充点位库。")
     else:
         st.write("方案初稿生成后，可在这里选择每日 POI。")
 
+    st.session_state.itinerary_rows, day_poi_ids = normalize_itinerary_and_pois(itinerary_records(itinerary), day_poi_ids, active_poi_df)
+    itinerary = st.session_state.itinerary_rows
+    st.session_state.day_poi_ids = day_poi_ids
+    while len(st.session_state.day_suggested_pois) < len(itinerary):
+        idx = len(st.session_state.day_suggested_pois)
+        row = itinerary[idx]
+        st.session_state.day_suggested_pois.append(suggested_pois_for_day(row.get("City"), row.get("Theme")))
+    st.session_state.day_suggested_pois = st.session_state.day_suggested_pois[:len(itinerary)]
     day_pois = [selected_poi_records(active_poi_df, ids) for ids in day_poi_ids]
+    if right_side_enabled:
+        sync_current_proposal_from_session()
     poi_min_cost, poi_max_cost = poi_cost_bounds(day_pois)
     st.caption(f"已选点位成本小计：{format_cost_range(poi_min_cost, poi_max_cost, 'CNY')}")
 
@@ -3174,7 +3970,7 @@ if main_nav == "方案生成":
 
     export_ready = st.session_state.generationStatus == "completed" and bool(itinerary_records(itinerary))
     if not export_ready:
-        st.warning("请先点击左侧「确定并生成方案初稿」，完成方案生成后再导出 PPT。")
+        st.warning("请先在客户需求对话区生成第一版方案，完成后再导出 PPT。")
 
     if st.button("生成英文方案 PPT", type="primary", disabled=not export_ready):
         visual_highlights = []

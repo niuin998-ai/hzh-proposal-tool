@@ -77,6 +77,36 @@ python poi_importer.py data/HZH医旅POI多维标签数据库-价格完善版.xl
 
 导入脚本会自动识别字段、生成缺失的 `poi_id`、去重、解析价格区间、解析时长，并把标签统一为分号分隔格式。
 
+
+## 飞书多维表格同步 POI
+
+POI 点位可以从飞书多维表格读取。第一版同步为只读模式：在飞书维护点位，工具点击「从飞书同步 POI」后读取表格并写入当前 POI 数据库。
+
+需要在本地 `.streamlit/secrets.toml` 或 Render Environment 中配置：
+
+```toml
+FEISHU_APP_ID = "cli_xxxxxxxxxxxxxxxx"
+FEISHU_APP_SECRET = "your-feishu-app-secret"
+FEISHU_APP_TOKEN = "bascnxxxxxxxxxxxxxxx"
+# 如果多维表格嵌在 wiki 里，也可以用 FEISHU_WIKI_URL 代替 FEISHU_APP_TOKEN
+# FEISHU_WIKI_URL = "https://my.feishu.cn/wiki/xxxxxxxxxxxx"
+FEISHU_TABLE_ID = "tblxxxxxxxxxxxxxxx"
+# 可选：只读取指定视图
+FEISHU_VIEW_ID = "vewxxxxxxxxxxxxxxx"
+```
+
+如果你的多维表格嵌在飞书知识库 wiki 页面里，可以直接在页面里粘贴 wiki 链接，工具会自动解析真实 app_token。飞书表头可以使用中文字段名，例如「点位编号」「中文名称」「英文名称」「点位类型」「城市」「区域」「建议游览时长」「最低成本价」「最高成本价」「币种」「标签」「适合人群」「中文介绍」「英文介绍」「图片地址」「地址」「内部备注」。工具会复用现有导入逻辑自动映射字段。
+
+使用步骤：
+
+1. 打开「POI 点位管理」。
+2. 展开「飞书多维表格同步」。
+3. 点击「从飞书同步 POI」。
+4. 检查字段映射和预览数据。
+5. 点击「确认写入当前 POI 数据库」。
+
+注意：飞书附件图片第一版不会自动下载，建议先在飞书中填写图片 URL 或项目内可访问的图片路径。
+
 ## POI 点位管理
 
 POI 数据库位于：

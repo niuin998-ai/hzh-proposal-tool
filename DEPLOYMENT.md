@@ -58,6 +58,22 @@ http://localhost:8501
 
 本地可参考 `.env.example`，不要提交真实 `.env` 或 `.streamlit/secrets.toml`。
 
+
+### 飞书多维表格同步配置
+
+如果要让线上工具读取飞书 POI 表，请在 Render 的 Environment 中增加：
+
+| 变量名 | 说明 |
+|---|---|
+| `FEISHU_APP_ID` | 飞书开放平台自建应用 App ID |
+| `FEISHU_APP_SECRET` | 飞书开放平台自建应用 App Secret |
+| `FEISHU_APP_TOKEN` | 多维表格 app_token。如果表格嵌在 wiki 里找不到，可改用 `FEISHU_WIKI_URL` |
+| `FEISHU_WIKI_URL` | 可选，飞书 wiki 页面链接，工具会自动解析多维表格 app_token |
+| `FEISHU_TABLE_ID` | 数据表 table_id |
+| `FEISHU_VIEW_ID` | 可选，只同步某一个视图 |
+
+飞书自建应用需要开通多维表格读取权限，并确保该应用有权限访问目标多维表格。第一版为手动同步，不会后台自动轮询飞书。
+
 ## 推荐部署方案
 
 ### 方案 A：Streamlit Community Cloud，适合快速试用

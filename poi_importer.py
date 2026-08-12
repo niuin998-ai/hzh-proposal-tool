@@ -83,22 +83,22 @@ FIELD_LABELS = {
 
 ALIASES = {
     "id": ["id", "ID", "内部ID", "唯一ID"],
-    "poi_id": ["poi_id", "poi id", "POI_ID", "编号", "点位编号", "poi编号"],
-    "code": ["code", "点位编码", "编码"],
-    "name_cn": ["点位名称", "名称", "POI名称", "poi名称", "中文名称", "中文名"],
-    "name_en": ["英文名", "英文名称", "英文名称/英文名", "name_en", "English Name"],
-    "category": ["类型", "分类", "产品类型", "点位类型", "一级模块", "二级类别", "模块"],
-    "city": ["城市", "地点", "所在城市", "目的地"],
-    "district": ["区域", "所在区域", "商圈", "区县"],
-    "duration_hours": ["时长_小时", "建议游览时长", "推荐时长", "时长", "游览时长", "体验时长"],
-    "price_min": ["成本下限_元", "最低成本价", "成本", "成本价", "价格", "门票价格", "成本价_元"],
-    "price_max": ["成本上限_元", "最高成本价", "成本", "成本价", "价格", "门票价格", "成本价_元"],
+    "poi_id": ["poi_id", "poi id", "POI_ID", "编号", "点位编号", "poi编号", "POI编号", "点位ID", "点位id", "记录编号"],
+    "code": ["code", "点位编码", "编码", "点位code", "内部编码"],
+    "name_cn": ["点位名称", "名称", "POI名称", "poi名称", "中文名称", "中文名", "点位名", "POI点位", "POI", "项目名称", "产品名称", "城市POI", "城市poi", "点位", "景点名称", "机构名称", "酒店名称", "餐厅名称"],
+    "name_en": ["英文名", "英文名称", "英文名称/英文名", "name_en", "English Name", "EnglishName", "POI英文名", "点位英文名", "英文点位名称"],
+    "category": ["类型", "分类", "产品类型", "点位类型", "一级模块", "二级类别", "模块", "类别", "POI类型", "poi类型", "点位分类", "资源类型", "业态", "场景类型"],
+    "city": ["城市", "地点", "所在城市", "目的地", "城市/区域", "城市区域", "所在地点", "所属城市", "城市名称"],
+    "district": ["区域", "所在区域", "商圈", "区县", "行政区", "片区", "城区", "区", "具体区域", "城市/区域"],
+    "duration_hours": ["时长_小时", "建议游览时长", "推荐时长", "时长", "游览时长", "体验时长", "建议时长", "停留时长", "预计时长", "预计用时", "用时", "小时", "建议游览时长（小时）"],
+    "price_min": ["成本下限_元", "最低成本价", "成本", "成本价", "价格", "门票价格", "成本价_元", "最低成本", "成本下限", "最低价", "价格下限", "成本区间", "预算成本", "参考成本", "采购价"],
+    "price_max": ["成本上限_元", "最高成本价", "成本", "成本价", "价格", "门票价格", "成本价_元", "最高成本", "成本上限", "最高价", "价格上限", "成本区间", "预算成本", "参考成本", "采购价"],
     "currency": ["币种", "货币"],
-    "tags": ["标签", "多维标签", "适合场景", "组合建议标签", "兴趣类型", "线路定位"],
-    "suitable_for": ["人群", "适合人群", "客户类型", "所属线路/适用场景", "适用客群"],
+    "tags": ["标签", "多维标签", "适合场景", "组合建议标签", "兴趣类型", "线路定位", "关键词", "特征标签", "推荐标签", "产品标签", "场景标签", "主题标签"],
+    "suitable_for": ["人群", "适合人群", "客户类型", "所属线路/适用场景", "适用客群", "目标客群", "适合客户", "客群", "推荐人群"],
     "description": ["综合描述", "description"],
-    "description_cn": ["简介", "中文介绍", "介绍", "价格说明", "线路特色"],
-    "description_en": ["英文介绍", "英文简介", "description_en"],
+    "description_cn": ["简介", "中文介绍", "介绍", "价格说明", "线路特色", "点位介绍", "中文简介", "内容介绍", "描述", "说明", "项目介绍"],
+    "description_en": ["英文介绍", "英文简介", "description_en", "English Description", "英文描述", "英文说明"],
     "recommended_reason": ["推荐理由", "推荐原因", "recommended_reason"],
     "highlights": ["亮点", "项目亮点", "highlights"],
     "target_users": ["目标客群", "target_users", "适合客户"],
@@ -109,7 +109,7 @@ ALIASES = {
     "image_source": ["图片来源", "image_source", "source"],
     "image_notes": ["图片备注", "图片用途", "image_notes"],
     "images": ["图片组", "images"],
-    "address": ["地址", "详细地址", "地点"],
+    "address": ["地址", "详细地址", "地点", "具体地址", "定位", "位置"],
     "opening_hours": ["开放时间", "营业时间", "opening_hours"],
     "reservation_info": ["预约信息", "预订信息", "reservation_info"],
     "notes": ["备注", "内部备注", "来源", "价格说明"],
@@ -283,9 +283,10 @@ def normalize_poi_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def transform_source_to_poi(source_df: pd.DataFrame) -> ImportResult:
+def transform_source_to_poi(source_df: pd.DataFrame, custom_mapping: dict[str, str] | None = None) -> ImportResult:
     source_df = source_df.dropna(how="all").copy()
-    mapping = build_mapping(source_df.columns)
+    mapping = custom_mapping or build_mapping(source_df.columns)
+    mapping = {target: source for target, source in mapping.items() if clean_text(source) and source in source_df.columns}
     rows = []
     seen_keys = set()
     duplicate_count = 0

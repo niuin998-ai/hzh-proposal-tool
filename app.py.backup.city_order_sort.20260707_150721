@@ -27,15 +27,8 @@ from customer_pdf_generator import build_pdf_draft_from_proposal, customer_pdf_f
 from poi_importer import (
     FIELD_LABELS as IMPORT_FIELD_LABELS,
     analyze_poi_file,
-    build_mapping,
     merge_poi_data,
-    transform_source_to_poi,
 )
-
-try:
-    from feishu_poi_sync import sync_feishu_pois
-except Exception:
-    sync_feishu_pois = None
 
 
 # HZH brand palette, sampled from the supplied HangZhou Health logo.
@@ -646,16 +639,13 @@ def inject_app_theme():
           background: #FEE2E2;
           border-color: var(--color-danger);
         }
+        .hzh-poi-col-id { width: 120px; }
+        .hzh-poi-col-cn { width: 190px; }
+        .hzh-poi-col-en { width: 220px; }
+        .hzh-poi-col-type { width: 135px; }
         .hzh-poi-col-city { width: 110px; }
-        .hzh-poi-col-name { width: 210px; }
-        .hzh-poi-col-feature { width: 260px; }
-        .hzh-poi-col-category { width: 130px; }
-        .hzh-poi-col-district { width: 120px; }
-        .hzh-poi-col-fit { width: 280px; }
-        .hzh-poi-col-budget { width: 175px; }
-        .hzh-poi-col-address { width: 260px; }
-        .hzh-poi-col-duration { width: 105px; }
-        .hzh-poi-col-currency { width: 90px; }
+        .hzh-poi-col-duration { width: 85px; }
+        .hzh-poi-col-price { width: 185px; }
         .hzh-poi-col-image { width: 125px; }
         .hzh-poi-col-action { width: 180px; }
         .hzh-poi-row-divider {
@@ -1513,78 +1503,6 @@ def generateRouteTemplateFromRequirements(requirements, poiDatabase):
 
 
 
-DEFAULT_FEISHU_WIKI_URL = "https://my.feishu.cn/wiki/ByyMwEWN0iPtVXksSDtcgjJfnLg?from=from_copylink"
-DEFAULT_FEISHU_TABLE_ID = "tblNnZpZDhlTHAiU"
-DEFAULT_FEISHU_VIEW_ID = "vewt5rgo06"
-
-
-def secret_or_env(name, default=""):
-    """Read a config value from Streamlit secrets first, then environment variables."""
-    value = ""
-    try:
-        value = st.secrets.get(name, "")
-    except Exception:
-        value = ""
-    if value is None:
-        value = ""
-    value = str(value).strip()
-    if value:
-        return value
-    return os.getenv(name, default).strip()
-
-
-def feishu_configured():
-    return all([
-        secret_or_env("FEISHU_APP_ID"),
-        secret_or_env("FEISHU_APP_SECRET"),
-        secret_or_env("FEISHU_APP_TOKEN") or secret_or_env("FEISHU_WIKI_URL") or DEFAULT_FEISHU_WIKI_URL,
-        secret_or_env("FEISHU_TABLE_ID") or DEFAULT_FEISHU_TABLE_ID,
-    ])
-
-
-def clean_feishu_visible_text(value):
-    """Clean Feishu visible text and remove option-id leftovers such as pure numbers."""
-    text = clean_text(value)
-    if not text:
-        return ""
-    parts = []
-    for raw in text.replace("，", ";").replace(",", ";").replace("、", ";").split(";"):
-        item = raw.strip()
-        if not item:
-            continue
-        if item.isdigit():
-            continue
-        parts.append(item)
-    return ";".join(parts)
-
-
-def feishu_poi_fixed_mapping(source_columns):
-    """Map the current Feishu POI master table fields to the internal POI schema."""
-    available = {clean_text(column): clean_text(column) for column in source_columns}
-    desired = {
-        "poi_id": "飞书记录ID",
-        "code": "飞书记录ID",
-        "name_cn": "POI/服务名称",
-        "category": "分类",
-        "city": "城市",
-        "district": "区域",
-        "duration_hours": "建议时长",
-        "price_min": "参考预算",
-        "price_max": "参考预算",
-        "currency": "预算单位",
-        "tags": "体验特色",
-        "suitable_for": "医旅适配及注意事项",
-        "description": "体验特色",
-        "description_cn": "体验特色",
-        "recommended_reason": "医旅适配及注意事项",
-        "highlights": "体验特色",
-        "address": "地址",
-        "notes": "医旅适配及注意事项",
-        "internal_remark": "医旅适配及注意事项",
-    }
-    return {target: available[source] for target, source in desired.items() if source in available}
-
-
 def deepseek_api_key():
     """Read DeepSeek API key from Streamlit secrets or environment variables."""
     try:
@@ -1637,136 +1555,6 @@ def call_deepseek_json(system_prompt, user_prompt, fallback=None):
         return fallback
 
 
-def ordered_city_mentions(text_value):
-    """Return route cities in the order they appear in the user's natural-language request."""
-    source = clean_text(text_value)
-    lower_source = source.lower()
-    city_candidates = [
-        ("Shanghai", ["上海", "shanghai"]),
-        ("Hangzhou", ["杭州", "hangzhou"]),
-        ("Yiwu", ["义乌", "yiwu"]),
-        ("Guangzhou", ["广州", "guangzhou"]),
-    ]
-    hits = []
-    for city, keys in city_candidates:
-        positions = []
-        for key in keys:
-            haystack = lower_source if key.isascii() else source
-            needle = key.lower() if key.isascii() else key
-            position = haystack.find(needle)
-            if position >= 0:
-                positions.append(position)
-        if positions:
-            hits.append((min(positions), city))
-    return [city for _, city in sorted(hits, key=lambda item: item[0])]
-
-
-def move_city_block_to_front(proposal, city_name):
-    """Move all days for a city to the front while preserving each city's internal order."""
-    target_key = city_key(city_name)
-    if not target_key:
-        return proposal
-    itinerary = proposal.get("itinerary") or []
-    front = [day for day in itinerary if city_key(day.get("city")) == target_key]
-    rest = [day for day in itinerary if city_key(day.get("city")) != target_key]
-    if not front:
-        return proposal
-    proposal["itinerary"] = front + rest
-    proposal["selected_pois"] = [day.get("poi_ids") or [] for day in proposal["itinerary"]]
-    return proposal
-
-
-def requested_day_count(text_value):
-    """Extract intended total trip days, prioritizing explicit trip-duration wording."""
-    text_value = clean_text(text_value)
-    patterns = [
-        r"(?:一共|总共|总计|共|整体|全程|还是|保持|控制在|不要超过)\s*(\d+)\s*天",
-        r"(\d+)\s*天\s*(?:行程|旅程|线路|旅行|游玩)",
-        r"(?:行程|旅程|线路|旅行|游玩)\s*(?:一共|总共|共|是|为)?\s*(\d+)\s*天",
-        r"(\d+)\s*(?:days?|day)",
-        r"(\d+)\s*天",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text_value, flags=re.I)
-        if match:
-            try:
-                return int(match.group(1))
-            except (TypeError, ValueError):
-                return None
-    return None
-
-
-def enforce_proposal_day_count(proposal, target_days, protected_cities=None, poi_database=None, requirements=None):
-    """Resize itinerary to the requested total day count while protecting newly requested cities and medical days."""
-    if not target_days or target_days <= 0:
-        return proposal
-    itinerary = proposal.get("itinerary") or []
-    protected_keys = {city_key(city) for city in (protected_cities or []) if city_key(city)}
-
-    def is_protected(day):
-        return city_key(day.get("city")) in protected_keys or is_medical_theme(day.get("theme"))
-
-    while len(itinerary) > target_days:
-        removable_index = None
-        for index in range(len(itinerary) - 1, -1, -1):
-            if not is_protected(itinerary[index]):
-                removable_index = index
-                break
-        if removable_index is None:
-            removable_index = len(itinerary) - 1
-        itinerary.pop(removable_index)
-
-    while len(itinerary) < target_days:
-        city = clean_text(itinerary[-1].get("city")) if itinerary else "Hangzhou"
-        itinerary.append(create_city_itinerary_day(city, itinerary, requirements or {}, poi_database))
-
-    for index, day in enumerate(itinerary, start=1):
-        day["day"] = index
-    proposal["itinerary"] = itinerary
-    proposal["selected_pois"] = [day.get("poi_ids") or [] for day in itinerary]
-    return proposal
-
-
-def create_city_itinerary_day(city_name, itinerary, requirements, poi_database):
-    """Create one itinerary day for an added city during conversational revision."""
-    city = clean_text(city_name)
-    day_number = len(itinerary) + 1
-    total_days = day_number
-    profile = route_day_profile(day_number, total_days, city, requirements or {})
-    if profile.get("theme") in ["Departure Preparation", "Arrival & Welcome"]:
-        profile["theme"] = generated_theme(max(2, day_number - 1), max(3, total_days + 1), city)
-    poi_records = poi_database.to_dict("records") if hasattr(poi_database, "to_dict") else (poi_database or [])
-    used_ids = {clean_text(poi_id) for day in itinerary for poi_id in (day.get("poi_ids") or []) if clean_text(poi_id)}
-    selected = select_pois_for_day(poi_records, city, profile, requirements or {}, used_ids)
-    theme = profile.get("theme") or generated_theme(max(2, day_number), max(3, total_days + 1), city)
-    arrangement = build_arrangement_from_pois(day_number, total_days, city, theme, selected)
-    poi_ids = [clean_text(poi.get("poi_id")) for poi in selected if clean_text(poi.get("poi_id"))]
-    return {
-        "day": day_number,
-        "city": city,
-        "theme": theme,
-        "description": arrangement,
-        "poi_ids": poi_ids,
-        "suggested_pois": [] if poi_ids else suggested_pois_for_day(city, theme),
-        "medical": "group" if is_medical_theme(theme) else "",
-        "notes": "AI added during conversational revision",
-    }
-
-
-def add_city_day_to_proposal(proposal, city_name, requirements, poi_database):
-    """Add a new city day before departure when the user asks to add a destination."""
-    itinerary = proposal.get("itinerary") or []
-    city = clean_text(city_name)
-    new_day = create_city_itinerary_day(city, itinerary, requirements, poi_database)
-    insert_index = len(itinerary)
-    if itinerary and keyword_hit(clean_text(itinerary[-1].get("theme")), ["Departure", "离境", "返程"]):
-        insert_index = max(len(itinerary) - 1, 0)
-    itinerary.insert(insert_index, new_day)
-    proposal["itinerary"] = itinerary
-    proposal["selected_pois"] = [day.get("poi_ids") or [] for day in itinerary]
-    return proposal
-
-
 def infer_requirements_from_text(user_requirements, filters):
     """Extract basic structured requirements from natural language plus sidebar filters."""
     text_value = clean_text(user_requirements)
@@ -1774,15 +1562,21 @@ def infer_requirements_from_text(user_requirements, filters):
     inferred = dict(filters or {})
     inferred["raw_user_input"] = text_value
 
-    extracted_days = requested_day_count(text_value)
-    if extracted_days:
-        inferred["days"] = extracted_days
-        inferred["nights"] = max(extracted_days - 1, 0)
+    day_match = re.search(r"(\d+)\s*(?:天|days?|day)", text_value, flags=re.I)
+    if day_match:
+        inferred["days"] = int(day_match.group(1))
+        inferred["nights"] = max(int(day_match.group(1)) - 1, 0)
     people_match = re.search(r"(\d+)\s*(?:个人|人|位|traveler|travelers|guests?)", text_value, flags=re.I)
     if people_match:
         inferred["customerCount"] = int(people_match.group(1))
 
-    mentioned_cities = ordered_city_mentions(text_value)
+    city_candidates = [
+        ("Hangzhou", ["杭州", "hangzhou"]),
+        ("Yiwu", ["义乌", "yiwu"]),
+        ("Shanghai", ["上海", "shanghai"]),
+        ("Guangzhou", ["广州", "guangzhou"]),
+    ]
+    mentioned_cities = [city for city, keys in city_candidates if any(key in lower or key in text_value for key in keys)]
     if mentioned_cities:
         inferred["cities"] = mentioned_cities
         inferred["routeCities"] = ", ".join(mentioned_cities)
@@ -1963,7 +1757,6 @@ def revise_proposal(current_proposal, user_instruction, filters, poi_database):
     """Revise current proposal in place according to a follow-up natural-language instruction."""
     proposal = json.loads(json.dumps(current_proposal or {}, ensure_ascii=False))
     instruction = clean_text(user_instruction)
-    target_days = requested_day_count(instruction) or int((filters or {}).get("days") or len(proposal.get("itinerary") or []) or 0)
     itinerary = proposal.get("itinerary") or []
     locked = set(proposal.get("locked_modules") or [])
 
@@ -1977,11 +1770,6 @@ def revise_proposal(current_proposal, user_instruction, filters, poi_database):
         proposal["proposal_intro"] = clean_text(llm_result.get("proposal_intro")) or fallback_intro
 
     if "itinerary" not in locked:
-        added_city_requests = ordered_city_mentions(instruction)
-        if added_city_requests and any(word in instruction for word in ["增加", "加入", "添加", "安排", "加上", "去"]):
-            for city_name in added_city_requests:
-                proposal = add_city_day_to_proposal(proposal, city_name, filters, poi_database)
-            itinerary = proposal.get("itinerary") or []
         if "义乌减少一天" in instruction or ("义乌" in instruction and "减少" in instruction):
             yiwu_indices = [i for i, day in enumerate(itinerary) if "yiwu" in clean_text(day.get("city")).lower()]
             if len(yiwu_indices) > 1:
@@ -2018,30 +1806,12 @@ def revise_proposal(current_proposal, user_instruction, filters, poi_database):
                 day = itinerary[day_no - 1]
                 day["description"] = f"A refined, client-friendly day in {day.get('city')} adjusted according to the latest consultant instruction: {instruction}"
 
-    first_city_match = re.search(r"(?:先到|先去|先飞到|飞到|从|第一站|先).*?(上海|杭州|义乌|广州|Shanghai|Hangzhou|Yiwu|Guangzhou)", instruction, flags=re.I)
-    if first_city_match:
-        proposal["itinerary"] = itinerary
-        proposal = move_city_block_to_front(proposal, first_city_match.group(1))
-        itinerary = proposal.get("itinerary") or []
-
     proposal["itinerary"] = itinerary
-    proposal = enforce_proposal_day_count(proposal, target_days, protected_cities=ordered_city_mentions(instruction), poi_database=poi_database, requirements=filters)
-    itinerary = proposal.get("itinerary") or []
     rows = [{"Day": i + 1, "City": day.get("city"), "Theme": day.get("theme"), "Arrangement": day.get("description")} for i, day in enumerate(itinerary)]
     ids = [day.get("poi_ids") or [] for day in itinerary]
     rows, ids = validate_generated_route(rows, ids, poi_database, filters)
-    existing_suggested = [day.get("suggested_pois") or [] for day in itinerary]
     proposal["itinerary"] = [
-        {
-            "day": row.get("Day"),
-            "city": row.get("City"),
-            "theme": row.get("Theme"),
-            "description": row.get("Arrangement"),
-            "poi_ids": ids[index] if index < len(ids) else [],
-            "suggested_pois": [] if (index < len(ids) and ids[index]) else (existing_suggested[index] if index < len(existing_suggested) and existing_suggested[index] else suggested_pois_for_day(row.get("City"), row.get("Theme"))),
-            "medical": "group" if is_medical_theme(row.get("Theme")) else "",
-            "notes": "",
-        }
+        {"day": row.get("Day"), "city": row.get("City"), "theme": row.get("Theme"), "description": row.get("Arrangement"), "poi_ids": ids[index] if index < len(ids) else [], "medical": "group" if is_medical_theme(row.get("Theme")) else "", "notes": ""}
         for index, row in enumerate(rows)
     ]
     proposal["selected_pois"] = ids
@@ -2942,21 +2712,8 @@ def table_cell(value, empty="暂无"):
     return html.escape(text)
 
 
-def feishu_budget_text(row):
-    """Render Feishu-style reference budget from internal cost fields."""
-    min_price = optional_number(row.get("price_min"))
-    max_price = optional_number(row.get("price_max"))
-    currency = clean_text(row.get("currency")) or "CNY"
-    if min_price is None and max_price is None:
-        return "暂无"
-    if min_price is not None and max_price is not None and min_price != max_price:
-        return f"{currency} {min_price:,.0f} - {max_price:,.0f}"
-    value = min_price if min_price is not None else max_price
-    return f"{currency} {value:,.0f}"
-
-
 def render_poi_list_table(poi_df, filtered_df):
-    """Render a fixed-width, horizontally scrollable POI list using the Feishu master table fields."""
+    """Render a fixed-width, horizontally scrollable POI list with row actions."""
     if filtered_df.empty:
         st.info("当前筛选条件下暂无 POI。")
         return
@@ -2965,23 +2722,18 @@ def render_poi_list_table(poi_df, filtered_df):
     for _, row in filtered_df.iterrows():
         poi_id = clean_text(row.get("poi_id"))
         duration = optional_number(row.get("duration_hours"))
-        duration_text = f"{duration:g}" if duration is not None else "暂无"
-        feature_text = clean_feishu_visible_text(row.get("tags")) or clean_feishu_visible_text(row.get("highlights")) or clean_feishu_visible_text(row.get("description_cn"))
-        fit_text = clean_feishu_visible_text(row.get("suitable_for")) or clean_feishu_visible_text(row.get("notes")) or clean_feishu_visible_text(row.get("internal_remark"))
+        duration_text = f"{duration:g}h" if duration is not None else "暂无"
         edit_href = f"?poi_action=edit&poi_id={quote(poi_id)}"
         delete_href = f"?poi_action=delete&poi_id={quote(poi_id)}"
         rows_html.append(
             "<tr>"
+            f"<td class='hzh-poi-col-id nowrap'>{table_cell(poi_id)}</td>"
+            f"<td class='hzh-poi-col-cn'>{table_cell(row.get('name_cn'))}</td>"
+            f"<td class='hzh-poi-col-en'>{table_cell(row.get('name_en'))}</td>"
+            f"<td class='hzh-poi-col-type'>{table_cell(row.get('category'))}</td>"
             f"<td class='hzh-poi-col-city nowrap'>{table_cell(row.get('city'))}</td>"
-            f"<td class='hzh-poi-col-name'>{table_cell(row.get('name_cn'))}</td>"
-            f"<td class='hzh-poi-col-feature'>{table_cell(feature_text)}</td>"
-            f"<td class='hzh-poi-col-category'>{table_cell(row.get('category'))}</td>"
-            f"<td class='hzh-poi-col-district nowrap'>{table_cell(row.get('district'))}</td>"
-            f"<td class='hzh-poi-col-fit'>{table_cell(fit_text)}</td>"
-            f"<td class='hzh-poi-col-budget nowrap'>{html.escape(feishu_budget_text(row))}</td>"
-            f"<td class='hzh-poi-col-address'>{table_cell(row.get('address'))}</td>"
             f"<td class='hzh-poi-col-duration nowrap'>{html.escape(duration_text)}</td>"
-            f"<td class='hzh-poi-col-currency nowrap'>{table_cell(row.get('currency'), 'CNY')}</td>"
+            f"<td class='hzh-poi-col-price nowrap'>{html.escape(poi_price_range(row))}</td>"
             f"<td class='hzh-poi-col-image nowrap'>{html.escape(image_summary_for_poi(row))}</td>"
             "<td class='hzh-poi-col-action hzh-poi-action-cell'>"
             f"<a class='hzh-poi-action-btn edit' href='{edit_href}'>编辑</a>"
@@ -2991,35 +2743,29 @@ def render_poi_list_table(poi_df, filtered_df):
         )
 
     table_html = """
-    <div class="hzh-poi-list-note">列表字段已按飞书「城市 POI 汇总表」展示；详情修改与图片管理请进入单个 POI 编辑页。</div>
+    <div class="hzh-poi-list-note">列表页只负责查看、筛选、进入编辑和软删除。字段修改与图片管理请进入单个 POI 详情编辑页。</div>
     <div class="hzh-poi-table-wrapper">
       <table class="hzh-poi-table">
         <colgroup>
+          <col class="hzh-poi-col-id" />
+          <col class="hzh-poi-col-cn" />
+          <col class="hzh-poi-col-en" />
+          <col class="hzh-poi-col-type" />
           <col class="hzh-poi-col-city" />
-          <col class="hzh-poi-col-name" />
-          <col class="hzh-poi-col-feature" />
-          <col class="hzh-poi-col-category" />
-          <col class="hzh-poi-col-district" />
-          <col class="hzh-poi-col-fit" />
-          <col class="hzh-poi-col-budget" />
-          <col class="hzh-poi-col-address" />
           <col class="hzh-poi-col-duration" />
-          <col class="hzh-poi-col-currency" />
+          <col class="hzh-poi-col-price" />
           <col class="hzh-poi-col-image" />
           <col class="hzh-poi-col-action" />
         </colgroup>
         <thead>
           <tr>
+            <th>点位编号</th>
+            <th>中文名称</th>
+            <th>英文名称</th>
+            <th>点位类型</th>
             <th>城市</th>
-            <th>POI/服务名称</th>
-            <th>体验特色</th>
-            <th>分类</th>
-            <th>区域</th>
-            <th>医旅适配及注意事项</th>
-            <th>参考预算</th>
-            <th>地址</th>
-            <th>建议时长</th>
-            <th>预算单位</th>
+            <th>时长</th>
+            <th>成本区间</th>
             <th>图片</th>
             <th>操作</th>
           </tr>
@@ -3049,6 +2795,7 @@ def render_poi_list_table(poi_df, filtered_df):
                 st.session_state.pending_delete_poi_id = ""
                 st.query_params.clear()
                 st.rerun()
+
 
 def render_poi_edit_page(poi_df, poi_id):
     """Render the second-level detail edit page for one POI."""
@@ -3264,112 +3011,6 @@ def render_poi_management(poi_df):
             mime="text/csv",
         )
 
-    with st.expander("飞书多维表格同步", expanded=False):
-        st.caption("从飞书多维表格实时读取 POI。第一版为只读同步：飞书是数据源，工具会把读取到的点位合并保存到当前 POI 数据库。")
-        if sync_feishu_pois is None:
-            st.error("飞书同步模块未加载，请确认 feishu_poi_sync.py 已随项目部署。")
-        configured = feishu_configured()
-        if configured:
-            st.success("已检测到飞书配置。")
-        else:
-            st.info("尚未配置完整飞书参数。请在本地 .streamlit/secrets.toml 或 Render 环境变量中配置 FEISHU_APP_ID、FEISHU_APP_SECRET、FEISHU_APP_TOKEN 或 FEISHU_WIKI_URL、FEISHU_TABLE_ID。")
-
-        st.caption("当前已固定连接你提供的「城市 POI 汇总表」。下面 3 个字段通常不需要改；view_id 默认留空，会同步整张表。")
-        manual_cols = st.columns(2)
-        with manual_cols[0]:
-            app_token_input = st.text_input(
-                "飞书 wiki 链接 / 多维表格 app_token",
-                value=DEFAULT_FEISHU_WIKI_URL,
-                help="默认使用你提供的飞书 wiki 链接，系统会自动解析真实多维表格 app_token。",
-            )
-        with manual_cols[1]:
-            table_id_input = st.text_input(
-                "城市 POI 汇总表 table_id",
-                value=DEFAULT_FEISHU_TABLE_ID,
-                help="已固定为城市 POI 汇总表：tblNnZpZDhlTHAiU。",
-            )
-        view_id_input = st.text_input(
-            "视图 view_id（可选，默认留空）",
-            value=DEFAULT_FEISHU_VIEW_ID,
-            placeholder="默认使用城市 POI 汇总表视图：vewt5rgo06",
-            help="已固定为当前城市 POI 汇总表视图；如需同步整张表可手动清空。",
-        )
-        sync_mode = st.radio("同步方式", ["覆盖同编号点位", "只新增不覆盖", "替换全部现有数据"], horizontal=True, key="feishu_sync_mode")
-
-        if st.button("从飞书同步 POI", type="primary", disabled=sync_feishu_pois is None):
-            try:
-                with st.spinner("正在读取飞书多维表格，并按固定字段同步 POI……"):
-                    raw_sync_result = sync_feishu_pois(
-                        secret_or_env("FEISHU_APP_ID"),
-                        secret_or_env("FEISHU_APP_SECRET"),
-                        app_token_input,
-                        table_id_input,
-                        view_id=view_id_input,
-                    )
-                    fixed_mapping = feishu_poi_fixed_mapping(raw_sync_result.source_dataframe.columns)
-                    import_result = transform_source_to_poi(raw_sync_result.source_dataframe, custom_mapping=fixed_mapping)
-                sync_result = raw_sync_result
-                mapping_rows = [
-                    {
-                        "系统字段": IMPORT_FIELD_LABELS.get(target, target),
-                        "系统字段 key": target,
-                        "飞书字段": source,
-                    }
-                    for target, source in import_result.mapping.items()
-                ]
-                st.session_state.feishu_import_preview = {
-                    "mapping_rows": mapping_rows,
-                    "dataframe": import_result.dataframe,
-                    "source_dataframe": sync_result.source_dataframe,
-                    "source_columns": import_result.source_columns,
-                    "record_count": sync_result.record_count,
-                    "missing_required_count": import_result.missing_required_count,
-                    "empty_price_count": import_result.empty_price_count,
-                    "duplicate_count": import_result.duplicate_count,
-                    "mode": sync_mode,
-                }
-            except Exception as exc:
-                st.error(f"飞书同步失败：{exc}")
-
-        preview = st.session_state.get("feishu_import_preview")
-        if preview:
-            st.markdown("**同步预览与写入**")
-            st.markdown("**固定字段映射结果**")
-            st.dataframe(preview["mapping_rows"], use_container_width=True, hide_index=True)
-            mapped_keys = {row.get("系统字段 key") for row in preview["mapping_rows"]}
-            required_keys = {"name_cn", "city", "category"}
-            missing_keys = sorted(required_keys - mapped_keys)
-            if missing_keys:
-                missing_labels = ", ".join(IMPORT_FIELD_LABELS.get(key, key) for key in missing_keys)
-                st.warning(f"以下关键字段没有同步到：{missing_labels}。请确认飞书表里有「POI/服务名称」「城市」「分类」这些列。")
-            with st.expander("查看飞书原始字段和原始数据", expanded=False):
-                st.caption("这里展示飞书原始字段，方便确认固定映射是否覆盖了当前表。")
-                st.write("飞书原始字段：" + "、".join(preview.get("source_columns", [])))
-                source_df = preview.get("source_dataframe")
-                if source_df is not None:
-                    st.dataframe(source_df.head(20), use_container_width=True, hide_index=True)
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("飞书记录数", preview["record_count"])
-            c2.metric("可同步点位", len(preview["dataframe"]))
-            c3.metric("缺少名称", preview["missing_required_count"])
-            c4.metric("价格为空", preview["empty_price_count"])
-            st.markdown("**同步数据预览（前 20 条，不是全部数据）**")
-            st.caption(f"本次从飞书读取 {preview['record_count']} 条记录；这里只显示前 20 条用于检查字段映射。")
-            st.dataframe(display_poi_df(preview["dataframe"].head(20)), use_container_width=True, hide_index=True)
-            if st.button("确认写入当前 POI 数据库", type="primary"):
-                before_count = len(poi_df)
-                if preview["mode"] == "替换全部现有数据":
-                    final_df = preview["dataframe"]
-                elif preview["mode"] == "覆盖同编号点位":
-                    final_df = merge_poi_data(poi_df, preview["dataframe"], overwrite=True)
-                else:
-                    final_df = merge_poi_data(poi_df, preview["dataframe"], overwrite=False)
-                save_pois(final_df)
-                after_count = len(final_df)
-                st.session_state.feishu_import_preview = None
-                st.success(f"飞书 POI 同步完成：当前数据库共 {after_count} 条，变化 {after_count - before_count:+d} 条。")
-                st.rerun()
-
     with st.expander("导入 POI 数据", expanded=False):
         uploaded_poi_file = st.file_uploader(
             "上传 Excel / CSV",
@@ -3427,15 +3068,15 @@ def render_poi_management(poi_df):
     management_df = active_pois_only(poi_df)
     filter_cols = st.columns(5)
     with filter_cols[0]:
-        categories = st.multiselect("分类", sorted([value for value in management_df["category"].unique() if clean_text(value)]))
+        categories = st.multiselect("点位类型", sorted([value for value in management_df["category"].unique() if clean_text(value)]))
     with filter_cols[1]:
         cities = st.multiselect("城市", sorted([value for value in management_df["city"].unique() if clean_text(value)]))
     with filter_cols[2]:
-        tags = st.multiselect("体验特色", unique_multi_values(management_df, "tags"))
+        tags = st.multiselect("标签", unique_multi_values(management_df, "tags"))
     with filter_cols[3]:
-        suitable_for = st.multiselect("医旅适配及注意事项", unique_multi_values(management_df, "suitable_for"))
+        suitable_for = st.multiselect("适合人群", unique_multi_values(management_df, "suitable_for"))
     with filter_cols[4]:
-        keyword = st.text_input("搜索 POI/服务名称")
+        keyword = st.text_input("搜索名称")
 
     filtered = filter_pois(management_df, categories, cities, tags, suitable_for, keyword)
     if filtered.empty:
@@ -3616,9 +3257,8 @@ if main_nav == "方案生成":
             st.session_state.proposal_messages.append({"role": "user", "content": dialogue_input})
             if st.session_state.current_proposal:
                 sync_current_proposal_from_session()
-                base_requirements = st.session_state.current_requirements or dialogue_filters
-                extracted_requirements = infer_requirements_from_text(dialogue_input, base_requirements)
-                st.session_state.current_requirements = {**base_requirements, **extracted_requirements}
+                extracted_requirements = infer_requirements_from_text(dialogue_input, dialogue_filters)
+                st.session_state.current_requirements = {**(st.session_state.current_requirements or {}), **extracted_requirements}
                 revised = revise_proposal(st.session_state.current_proposal, dialogue_input, st.session_state.current_requirements, active_poi_df)
                 proposal_to_session_state(revised)
                 append_proposal_version(f"迭代：{shorten_client_text(dialogue_input, 28)}")
@@ -3713,75 +3353,37 @@ if main_nav == "方案生成":
         st.session_state.generated_intro = generated_intro
 
         st.subheader("英文行程安排")
-        st.caption("可直接拖动表格最左侧手柄调整每天顺序；拖拽后系统会自动重排 Day 编号，并同步每日点位选择与导出顺序。")
-        editor_rows = []
-        for row_index, row in enumerate(st.session_state.itinerary_rows):
-            editor_row = dict(row)
-            editor_row["拖拽"] = "☰"
-            editor_row["_row_id"] = row_index
-            editor_rows.append(editor_row)
+        st.caption("可先拖拽调整每天顺序；拖拽后系统会自动重排 Day 编号，并同步每日点位选择与导出顺序。")
+        sort_labels = [itinerary_sort_label(row, index) for index, row in enumerate(st.session_state.itinerary_rows)]
         try:
-            from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
-            grid_df = pd.DataFrame(editor_rows)
-            grid_builder = GridOptionsBuilder.from_dataframe(grid_df)
-            grid_builder.configure_default_column(editable=True, resizable=True, wrapText=True, autoHeight=True)
-            grid_builder.configure_column("拖拽", header_name="", rowDrag=True, editable=False, width=54, pinned="left")
-            grid_builder.configure_column("Day", header_name="天数", editable=False, width=80)
-            grid_builder.configure_column("City", header_name="英文城市", width=150)
-            grid_builder.configure_column("Theme", header_name="英文主题", width=260)
-            grid_builder.configure_column("Arrangement", header_name="英文行程安排", width=620)
-            grid_builder.configure_column("_row_id", hide=True)
-            grid_options = grid_builder.build()
-            grid_options["rowDragManaged"] = True
-            grid_options["rowDragEntireRow"] = True
-            grid_options["animateRows"] = True
-            grid_options["suppressMoveWhenRowDragging"] = False
-            grid_response = AgGrid(
-                grid_df,
-                gridOptions=grid_options,
-                update_mode=GridUpdateMode.MODEL_CHANGED,
-                data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                fit_columns_on_grid_load=False,
-                allow_unsafe_jscode=True,
-                update_on=["rowDragEnd", "cellValueChanged"],
-                height=min(620, 92 + 46 * max(len(editor_rows), 3)),
-                key=f"itinerary_drag_grid_{st.session_state.draft_version}",
-            )
-            edited_records = itinerary_records(grid_response.get("data", editor_rows))
-        except Exception as grid_exc:
-            st.warning(f"拖拽表格组件未启用：{grid_exc}。请先安装依赖：pip install streamlit-aggrid")
-            edited_records = itinerary_records(st.data_editor(
-                editor_rows,
-                num_rows="dynamic",
-                use_container_width=True,
-                column_order=["Day", "City", "Theme", "Arrangement"],
-                column_config={
-                    "Day": st.column_config.NumberColumn("天数", min_value=1, step=1, disabled=True),
-                    "City": st.column_config.TextColumn("英文城市"),
-                    "Theme": st.column_config.TextColumn("英文主题"),
-                    "Arrangement": st.column_config.TextColumn("英文行程安排"),
-                    "拖拽": None,
-                    "_row_id": None,
-                },
-                key=f"itinerary_editor_fallback_{st.session_state.draft_version}",
-            ))
-        itinerary = []
-        reordered_day_poi_ids = []
-        reordered_suggested_pois = []
-        for record in edited_records:
-            original_index = int(optional_number(record.get("_row_id")) or 0)
-            itinerary.append({
-                "Day": record.get("Day"),
-                "City": record.get("City"),
-                "Theme": record.get("Theme"),
-                "Arrangement": record.get("Arrangement"),
-            })
-            reordered_day_poi_ids.append(st.session_state.day_poi_ids[original_index] if original_index < len(st.session_state.day_poi_ids) else [])
-            reordered_suggested_pois.append(st.session_state.day_suggested_pois[original_index] if original_index < len(st.session_state.day_suggested_pois) else [])
-        old_order = list(range(len(st.session_state.itinerary_rows)))
-        new_order = [int(optional_number(record.get("_row_id")) or 0) for record in edited_records]
-        st.session_state.day_poi_ids = reordered_day_poi_ids
-        st.session_state.day_suggested_pois = reordered_suggested_pois
+            from streamlit_sortables import sort_items
+            sorted_labels = sort_items(sort_labels, direction="vertical", key=f"itinerary_sort_{st.session_state.draft_version}")
+            if sorted_labels and sorted_labels != sort_labels:
+                new_rows, new_day_poi_ids = reorder_itinerary_by_labels(st.session_state.itinerary_rows, st.session_state.day_poi_ids, sorted_labels)
+                old_rows = st.session_state.itinerary_rows
+                old_suggested = st.session_state.get("day_suggested_pois", [])
+                old_label_to_index = {itinerary_sort_label(row, idx): idx for idx, row in enumerate(old_rows)}
+                st.session_state.itinerary_rows = new_rows
+                st.session_state.day_poi_ids = new_day_poi_ids
+                st.session_state.day_suggested_pois = [old_suggested[old_label_to_index[label]] if old_label_to_index.get(label, -1) < len(old_suggested) else [] for label in sorted_labels]
+                st.session_state.draft_version += 1
+                st.toast("行程顺序已更新")
+                st.rerun()
+        except ImportError:
+            st.info("部署后安装 streamlit-sortables 即可启用拖拽排序；当前仍可直接编辑表格内容。")
+
+        itinerary = st.data_editor(
+            st.session_state.itinerary_rows,
+            num_rows="dynamic",
+            use_container_width=True,
+            column_config={
+                "Day": st.column_config.NumberColumn("天数", min_value=1, step=1, disabled=True),
+                "City": st.column_config.TextColumn("英文城市"),
+                "Theme": st.column_config.TextColumn("英文主题"),
+                "Arrangement": st.column_config.TextColumn("英文行程安排"),
+            },
+            key=f"itinerary_editor_{st.session_state.draft_version}",
+        )
         normalized_rows, normalized_day_poi_ids = normalize_itinerary_and_pois(itinerary_records(itinerary), st.session_state.day_poi_ids, active_poi_df)
         st.session_state.itinerary_rows = normalized_rows
         st.session_state.day_poi_ids = normalized_day_poi_ids
@@ -3791,11 +3393,6 @@ if main_nav == "方案生成":
             st.session_state.day_suggested_pois.append(suggested_pois_for_day(row.get("City"), row.get("Theme")))
         st.session_state.day_suggested_pois = st.session_state.day_suggested_pois[:len(normalized_rows)]
         itinerary = normalized_rows
-        if new_order != old_order and len(new_order) == len(old_order):
-            sync_current_proposal_from_session()
-            st.session_state.draft_version += 1
-            st.toast("行程顺序已同步更新")
-            st.rerun()
     else:
         generated_intro = ""
         itinerary = []

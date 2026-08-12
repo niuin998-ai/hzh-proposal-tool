@@ -1,0 +1,7 @@
+streamlit>=1.36
+python-pptx>=0.6.23
+Pillow>=10.0
+pandas>=2.0
+openpyxl>=3.1
+reportlab>=4.0
+streamlit-sortables>=0.2.0

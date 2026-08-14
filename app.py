@@ -1661,6 +1661,84 @@ def ordered_city_mentions(text_value):
     return [city for _, city in sorted(hits, key=lambda item: item[0])]
 
 
+def chinese_number_to_int(value):
+    """Parse small Chinese ordinal numbers used in day references."""
+    text = clean_text(value)
+    if not text:
+        return None
+    digits = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if text in digits:
+        return digits[text]
+    if text == "十":
+        return 10
+    if text.startswith("十"):
+        return 10 + digits.get(text[1:], 0)
+    if "十" in text:
+        left, right = text.split("十", 1)
+        return digits.get(left, 0) * 10 + (digits.get(right, 0) if right else 0)
+    return None
+
+
+def extract_referenced_day_number(text_value):
+    """Find day references such as Day 3, 第3天, or 第三天 without treating them as trip length."""
+    text = clean_text(text_value)
+    match = re.search(r"day\s*(\d+)|第\s*(\d+)\s*天", text, flags=re.I)
+    if match:
+        return int(match.group(1) or match.group(2))
+    chinese_match = re.search(r"第\s*([一二两三四五六七八九十]+)\s*天", text)
+    if chinese_match:
+        return chinese_number_to_int(chinese_match.group(1))
+    return None
+
+
+def requested_day_city_change(text_value):
+    """Parse instructions like '把第三天的杭州行程改成义乌的'."""
+    text = clean_text(text_value)
+    day_no = extract_referenced_day_number(text)
+    if not day_no:
+        return None, ""
+    city_mentions = ordered_city_mentions(text)
+    if not city_mentions:
+        return day_no, ""
+    return day_no, city_mentions[-1]
+
+
+def apply_day_city_change(proposal, day_no, city_name, poi_database=None, requirements=None):
+    """Change one itinerary day to a target city and refresh its city-bound POIs."""
+    itinerary = proposal.get("itinerary") or []
+    if not day_no or day_no < 1 or day_no > len(itinerary) or not clean_text(city_name):
+        return proposal, False
+
+    target_city = clean_text(city_name)
+    day = itinerary[day_no - 1]
+    changed = city_key(day.get("city")) != city_key(target_city)
+    day["city"] = target_city
+
+    theme = clean_text(day.get("theme"))
+    if not theme or keyword_hit(theme, ["Arrival", "Departure", "到达", "离境"]):
+        theme = generated_theme(day_no, len(itinerary), target_city)
+    day["theme"] = theme
+
+    poi_records = poi_database.to_dict("records") if hasattr(poi_database, "to_dict") else (poi_database or [])
+    used_ids = {
+        clean_text(poi_id)
+        for index, existing_day in enumerate(itinerary)
+        if index != day_no - 1
+        for poi_id in (existing_day.get("poi_ids") or [])
+        if clean_text(poi_id)
+    }
+    profile = {"theme": theme, "categories": []}
+    selected = select_pois_for_day(poi_records, target_city, profile, requirements or {}, used_ids)
+    poi_ids = [clean_text(poi.get("poi_id")) for poi in selected if clean_text(poi.get("poi_id"))]
+    day["poi_ids"] = poi_ids
+    day["suggested_pois"] = [] if poi_ids else suggested_pois_for_day(target_city, theme)
+    day["description"] = build_arrangement_from_pois(day_no, len(itinerary), target_city, theme, selected)
+    itinerary[day_no - 1] = day
+    proposal["itinerary"] = itinerary
+    proposal["selected_pois"] = [item.get("poi_ids") or [] for item in itinerary]
+    return proposal, changed
+
+
 def move_city_block_to_front(proposal, city_name):
     """Move all days for a city to the front while preserving each city's internal order."""
     target_key = city_key(city_name)
@@ -1679,12 +1757,14 @@ def move_city_block_to_front(proposal, city_name):
 def requested_day_count(text_value):
     """Extract intended total trip days, prioritizing explicit trip-duration wording."""
     text_value = clean_text(text_value)
+    if extract_referenced_day_number(text_value) and not any(word in text_value for word in ["一共", "总共", "总计", "共", "整体", "全程", "保持", "控制", "不要超过"]):
+        return None
     patterns = [
         r"(?:一共|总共|总计|共|整体|全程|还是|保持|控制在|不要超过)\s*(\d+)\s*天",
         r"(\d+)\s*天\s*(?:行程|旅程|线路|旅行|游玩)",
         r"(?:行程|旅程|线路|旅行|游玩)\s*(?:一共|总共|共|是|为)?\s*(\d+)\s*天",
         r"(\d+)\s*(?:days?|day)",
-        r"(\d+)\s*天",
+        r"(?<!第)(\d+)\s*天",
     ]
     for pattern in patterns:
         match = re.search(pattern, text_value, flags=re.I)
@@ -1963,8 +2043,8 @@ def revise_proposal(current_proposal, user_instruction, filters, poi_database):
     """Revise current proposal in place according to a follow-up natural-language instruction."""
     proposal = json.loads(json.dumps(current_proposal or {}, ensure_ascii=False))
     instruction = clean_text(user_instruction)
-    target_days = requested_day_count(instruction) or int((filters or {}).get("days") or len(proposal.get("itinerary") or []) or 0)
     itinerary = proposal.get("itinerary") or []
+    target_days = requested_day_count(instruction) or len(itinerary)
     locked = set(proposal.get("locked_modules") or [])
 
     if "proposal_intro" not in locked and any(word in instruction for word in ["简介", "高级", "高端", "更好", "优化英文"]):
@@ -1977,8 +2057,12 @@ def revise_proposal(current_proposal, user_instruction, filters, poi_database):
         proposal["proposal_intro"] = clean_text(llm_result.get("proposal_intro")) or fallback_intro
 
     if "itinerary" not in locked:
+        change_day_no, change_city = requested_day_city_change(instruction)
+        if change_day_no and change_city and any(word in instruction for word in ["改", "换", "调整", "变成", "改成", "换成"]):
+            proposal, _changed_day_city = apply_day_city_change(proposal, change_day_no, change_city, poi_database, filters)
+            itinerary = proposal.get("itinerary") or []
         added_city_requests = ordered_city_mentions(instruction)
-        if added_city_requests and any(word in instruction for word in ["增加", "加入", "添加", "安排", "加上", "去"]):
+        if added_city_requests and not change_day_no and any(word in instruction for word in ["增加", "加入", "添加", "安排", "加上", "去"]):
             for city_name in added_city_requests:
                 proposal = add_city_day_to_proposal(proposal, city_name, filters, poi_database)
             itinerary = proposal.get("itinerary") or []
@@ -3619,10 +3703,17 @@ if main_nav == "方案生成":
                 base_requirements = st.session_state.current_requirements or dialogue_filters
                 extracted_requirements = infer_requirements_from_text(dialogue_input, base_requirements)
                 st.session_state.current_requirements = {**base_requirements, **extracted_requirements}
+                before_revision = json.dumps(st.session_state.current_proposal, sort_keys=True, ensure_ascii=False)
                 revised = revise_proposal(st.session_state.current_proposal, dialogue_input, st.session_state.current_requirements, active_poi_df)
-                proposal_to_session_state(revised)
-                append_proposal_version(f"迭代：{shorten_client_text(dialogue_input, 28)}")
-                st.session_state.proposal_messages.append({"role": "assistant", "content": "已基于当前方案完成迭代修改，并同步到右侧方案草稿。"})
+                after_revision = json.dumps(revised, sort_keys=True, ensure_ascii=False)
+                if after_revision == before_revision:
+                    st.session_state.proposal_messages.append({"role": "assistant", "content": "没有检测到可执行的方案变化，请说得更具体一点，例如：把第三天改成义乌。"})
+                    st.session_state.generationStatus = "stale"
+                    st.session_state.generation_error = "本次调整没有改变当前方案。"
+                else:
+                    proposal_to_session_state(revised)
+                    append_proposal_version(f"迭代：{shorten_client_text(dialogue_input, 28)}")
+                    st.session_state.proposal_messages.append({"role": "assistant", "content": "已基于当前方案完成迭代修改，并同步到右侧方案草稿。"})
             else:
                 extracted_requirements = infer_requirements_from_text(dialogue_input, dialogue_filters)
                 st.session_state.current_requirements = extracted_requirements
